@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from "react";
+import MemoProposalReview from "./MemoProposalReview";
 import useAppStore from "../../store/useAppStore";
 import {
   StickyNote, Trash2, Search, Filter, Archive, ListChecks, X,
@@ -19,12 +20,19 @@ const SECTION_MAP = {
 };
 
 export default function MemoManager() {
+  const memoProposals = useAppStore((s) => s.memoProposals);
+  const dismissMemoProposal = useAppStore((s) => s.dismissMemoProposal);
+  const authToken = useAppStore((s) => s.authToken);
+  const backendPort = useAppStore((s) => s.backendPort);
+  const memoSyncError = useAppStore((s) => s.memoSyncError);
+  const currentUser = useAppStore((s) => s.currentUser);
   const isDarkMode = useAppStore((s) => s.isDarkMode);
   const userComments = useAppStore((s) => s.userComments);
   const addComment = useAppStore((s) => s.addComment);
   const removeComment = useAppStore((s) => s.removeComment);
   const syncMemos = useAppStore((s) => s.syncMemos);
   const userRole = useAppStore((s) => s.userRole);
+  const serverSessionId = useAppStore((s) => s.serverSessionId);
   const currentSessionId = useAppStore((s) => s.currentSessionId);
   const canEdit = !userRole || userRole === "pm" || userRole === "engineer";
 
@@ -45,7 +53,7 @@ export default function MemoManager() {
     });
   };
 
-  useEffect(() => { syncMemos(); }, [currentSessionId, syncMemos]);
+  useEffect(() => { syncMemos(); }, [currentSessionId, serverSessionId, authToken, currentUser?.id, currentUser?.team_id, backendPort, syncMemos]);
 
   const visibleByMode = useMemo(
     () => userComments.filter((m) => (viewMode === "applied" ? !!m.applied : !m.applied)),
@@ -80,13 +88,15 @@ export default function MemoManager() {
 
   const handleAddMemo = async () => {
     if (!newMemoText.trim()) return;
-    await addComment({ text: newMemoText.trim(), section: newMemoSection, selectedText: "", detail: "" });
+    const saved = await addComment({ text: newMemoText.trim(), section: newMemoSection, selectedText: "", detail: "" });
+    if (!saved) return;
     setNewMemoText("");
     setShowAddForm(false);
   };
 
   return (
     <div className={`h-full flex flex-col p-6 space-y-6 ${isDarkMode ? "text-slate-300" : "text-slate-800"}`}>
+      {memoSyncError && <p role="alert">{memoSyncError} <button onClick={() => syncMemos()}>목록 다시 확인</button></p>}
       <div className="flex flex-col gap-4">
         <div className="flex items-center justify-between">
           <h2 className={`text-2xl font-black tracking-tight ${isDarkMode ? "text-white" : "text-slate-900"}`}>
@@ -110,6 +120,10 @@ export default function MemoManager() {
         <p className="text-sm opacity-60">
           프로젝트 수행 중 기록된 모든 지적사항과 메모를 중앙에서 관리합니다.
         </p>
+
+        {(memoProposals || []).filter((p) => p.session_id === serverSessionId && p.actor_id === currentUser?.id).map((p) => (
+          <MemoProposalReview key={p.proposal_id} proposal={p} onDismiss={dismissMemoProposal} />
+        ))}
 
         {/* 단일 트리거 안내 — 메모는 메인 화면의 🚀 버튼이 함께 반영함 */}
         <div

@@ -75,7 +75,7 @@ def _remember_cache_entry(cache: OrderedDict[str, Any], key: str, value: Any):
         cache.popitem(last=False)
 
 # ── API 키 해석 ────────────────────────────────
-_CLOUD_RUN_SERVER = "https://navigator-server-640700885251.asia-northeast3.run.app"
+_CLOUD_RUN_SERVER = "https://navigator-server-681502864272.asia-northeast3.run.app"
 
 def _fetch_key_from_server() -> str:
     """Cloud Run /keys/active 엔드포인트에서 Gemini 키를 JWT로 인증하여 가져온다."""

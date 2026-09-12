@@ -198,6 +198,7 @@ async def _run_pipeline_base(
     result_node: str = "complete",
     save: bool = True,
     result_mutator=None,
+    persistence_context=None,
     log=None,
 ) -> dict:
     """공통 파이프라인 실행, 결과 정형화, 전송, 저장 처리.
@@ -218,7 +219,9 @@ async def _run_pipeline_base(
                 result_mutator(shaped)
 
             # 최종 결과를 로컬 DB에 영속화
-            _persist_analysis_result(result.get("run_id", ""), shaped)
+            if not persistence_context:
+                raise ValueError("Authenticated project context is required for result persistence")
+            shaped = _persist_analysis_result(persistence_context["run_id"], shaped, persistence_context)
 
             await manager.send_json(ws, {"type": "result", "node": result_node, "data": shaped})
         
@@ -248,26 +251,24 @@ async def run_analysis(ws: WebSocket, payload: dict) -> None:
 
     get_logger().info("run_analysis_payload", action_type=action_type, source_dir=source_dir, idea=idea[:50])
 
-    # ── 사용자 인증 및 GitHub 토큰 추출 ──
-    github_oauth_token = None
-    if auth_token:
-        db = SessionLocal()
-        try:
-            decoded = decode_token(auth_token)
-            if decoded:
-                user = get_user_by_id(db, decoded.get("sub", ""))
-                if user:
-                    github_oauth_token = user.github_oauth_token
-                    if user.role != "pm":
-                        await manager.send_json(ws, {
-                            "type": "error",
-                            "data": {"message": "LLM 분석은 PM 권한이 필요합니다."}
-                        })
-                        return
-        except Exception:
-            get_logger().warning("Failed to resolve user from auth_token in pipeline")
-        finally:
-            db.close()
+    # Bind project ownership outside model-controlled state before any pipeline work.
+    from auth.deps import get_current_user_optional
+    from auth.database import SharedSessionLocal
+    from pipeline.domain.chat.memo_approval import authorize_session
+    project_id = payload.get("project_session_id") or ""
+    try:
+        with SessionLocal() as db, SharedSessionLocal() as shared_db:
+            user = get_current_user_optional(token=auth_token, db=shared_db)
+            project = authorize_session(db, shared_db, user, project_id)
+            if user.role != "pm":
+                raise ValueError("LLM 분석은 PM 권한이 필요합니다.")
+            if project.team_id:
+                authorize_session(db, shared_db, user, project_id, pm=True)
+            actor_id = user.id
+            github_oauth_token = user.github_oauth_token if is_github_repo_format(source_dir) else None
+    except Exception as exc:
+        await manager.send_json(ws, {"type": "error", "data": {"message": getattr(exc, "detail", None) or str(exc)}})
+        return
 
     # ── GitHub 레포지토리인 경우 캐싱 처리 ──
     if is_github_repo_format(source_dir):
@@ -307,7 +308,8 @@ async def run_analysis(ws: WebSocket, payload: dict) -> None:
             })
             return
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    from uuid import uuid4
+    run_id = str(uuid4())
     log = get_logger(run_id)
     log.info("analysis_start", action_type=action_type)
 
@@ -342,6 +344,8 @@ async def run_analysis(ws: WebSocket, payload: dict) -> None:
     if pm_result.get("error"):
         return
 
+    pm_result["run_id"] = run_id  # Preserve handler-assigned identity across model stages.
+
     # 2. SA Pipeline (Stage 2) - 아키텍처 설계
     sa_result = await _run_pipeline_base(
         ws,
@@ -351,6 +355,7 @@ async def run_analysis(ws: WebSocket, payload: dict) -> None:
         pipeline_type=analysis_pipeline_type(action_type),
         result_node="complete",
         save=True,
+        persistence_context={"run_id": run_id, "project_id": project_id, "actor_id": actor_id, "auth_token": auth_token},
         log=log,
     )
 
@@ -364,6 +369,18 @@ async def run_idea_chat(ws: WebSocket, payload: dict) -> None:
     # 프론트가 currentSessionId를 보내면 그것에 묶어 영속화하고,
     # 비어 있으면(=활성 프로젝트 없음) 메모 영속화 자체를 스킵해 chat_global 누적을 차단.
     chat_session_id = (payload.get("session_id") or "").strip()
+
+    # Authenticate before invoking the model, not only when it proposes a memo.
+    from auth.deps import get_current_user_optional
+    from auth.database import SharedSessionLocal
+    from pipeline.domain.chat.memo_approval import authorize_session
+    try:
+        with SessionLocal() as db, SharedSessionLocal() as shared_db:
+            user = get_current_user_optional(token=payload.get("auth_token", ""), db=shared_db)
+            authorize_session(db, shared_db, user, chat_session_id)
+    except Exception as exc:
+        await manager.send_json(ws, {"type": "error", "data": {"message": getattr(exc, "detail", None) or str(exc)}})
+        return
 
     result = await _run_pipeline_base(
         ws,
@@ -391,55 +408,21 @@ async def run_idea_chat(ws: WebSocket, payload: dict) -> None:
         f"notes_to_add type={type(result.get('notes_to_add')).__name__}"
     )
 
-    # ── 채팅 의도로 만들어진 메모를 SQLite(local.db)에 직접 영속화 ──
+    # Model output is a review candidate, never a database write request.
     raw_notes = result.get("notes_to_add") or []
-    persisted_notes: list = []
-    # 활성 세션이 없으면 메모를 DB에 쓰지 않는다.
-    # WS 응답은 빈 notes_to_add로 정상 진행 → 프론트는 평소처럼 동작.
-    if raw_notes and chat_session_id:
+    memo_proposal = None
+    memo_proposal_error = None
+    if raw_notes:
         try:
-            from auth.models import MemoItem
-            db = SessionLocal()
-            try:
-                # 같은 세션에 이미 저장된 메모 텍스트 — LLM이 chat_history를 보고
-                # 이전 항목까지 누적해 notes_to_add를 반환하는 회귀를 차단한다.
-                # 텍스트 기반 dedupe로 같은 (session_id, text) 페어 중복 insert를 막음.
-                existing_texts = {
-                    (row[0] or "").strip()
-                    for row in db.query(MemoItem.text)
-                    .filter(MemoItem.session_id == chat_session_id)
-                    .all()
-                }
-                for note in raw_notes:
-                    if not isinstance(note, dict):
-                        continue
-                    text = str(note.get("text") or "").strip()
-                    if not text or text in existing_texts:
-                        continue
-                    existing_texts.add(text)  # 같은 응답 내 중복도 차단
-                    item = MemoItem(
-                        session_id=chat_session_id,
-                        text=text,
-                        selected_text="",
-                        section=str(note.get("section") or "Idea Chat").strip() or "Idea Chat",
-                        detail=str(note.get("detail") or "").strip(),
-                    )
-                    db.add(item)
-                    persisted_notes.append({
-                        "id": item.id,
-                        "text": text,
-                        "section": item.section,
-                        "detail": item.detail,
-                    })
-                db.commit()
-            finally:
-                db.close()
-            get_logger().info(
-                f"[idea_chat] 채팅 메모 {len(persisted_notes)}/{len(raw_notes)}건 영속화 "
-                f"(session_id={chat_session_id})"
-            )
-        except Exception as memo_err:
-            get_logger().warning(f"[idea_chat] memo 영속화 실패: {memo_err}")
+            from auth.deps import get_current_user_optional
+            from auth.database import SharedSessionLocal
+            from pipeline.domain.chat.memo_approval import issue_memo_proposal
+            with SessionLocal() as db, SharedSessionLocal() as shared_db:
+                user = get_current_user_optional(token=payload.get("auth_token", ""), db=shared_db)
+                memo_proposal = issue_memo_proposal(db, shared_db, user, chat_session_id, raw_notes)
+        except Exception as exc:
+            memo_proposal_error = getattr(exc, "detail", None) or "메모 제안을 준비하지 못했습니다. 다시 시도하세요."
+            get_logger().warning("[idea_chat] memo review unavailable; no memo saved")
 
     await manager.send_json(ws, {
         "type": "result",
@@ -450,7 +433,9 @@ async def run_idea_chat(ws: WebSocket, payload: dict) -> None:
             "idea_ready": result.get("idea_ready", False),
             "idea_summary": result.get("idea_summary", ""),
             "suggested_mode": result.get("suggested_mode", "create"),
-            "notes_to_add": persisted_notes,  # 백엔드가 부여한 진짜 ID 포함
+            "notes_to_add": [],  # Legacy clients must never mistake candidates for saved memos.
+            "memo_proposal": memo_proposal,
+            "memo_proposal_error": memo_proposal_error,
             "suggested_followups": result.get("suggested_followups", []),
             "pipeline_type": "idea_chat",
         },
@@ -548,30 +533,16 @@ async def _emit_thinking(
         })
 
 
-def _persist_analysis_result(run_id: str, shaped: dict) -> None:
-    """분석 결과를 AnalysisResult 테이블에 저장한다."""
-    if not run_id:
-        return
-    try:
-        import json as _json
-        from auth.models import AnalysisSession, AnalysisResult
-        db = SessionLocal()
-        try:
-            # AnalysisSession 레코드가 없으면 먼저 생성
-            if not db.query(AnalysisSession).filter(AnalysisSession.run_id == run_id).first():
-                db.add(AnalysisSession(run_id=run_id))
-
-            # 기존 결과가 있으면 덮어쓰기
-            existing = db.query(AnalysisResult).filter(AnalysisResult.run_id == run_id).first()
-            if existing:
-                existing.shaped_result = _json.dumps(shaped, ensure_ascii=False)
-            else:
-                db.add(AnalysisResult(run_id=run_id, shaped_result=_json.dumps(shaped, ensure_ascii=False)))
-            db.commit()
-        finally:
-            db.close()
-    except Exception as e:
-        get_logger().warning(f"[persist_result] 결과 저장 실패 run_id={run_id}: {e}")
+def _persist_analysis_result(run_id: str, shaped: dict, context: dict) -> dict:
+    """Commit owned results before emitting success. Never trust model owner fields."""
+    from auth.database import SharedSessionLocal
+    from pipeline.domain.chat.project_sessions import persist_owned_result
+    with SessionLocal() as db, SharedSessionLocal() as shared_db:
+        from auth.deps import get_current_user_optional
+        user = get_current_user_optional(token=context.get("auth_token", ""), db=shared_db)
+        if user is None or user.id != context["actor_id"]:
+            raise ValueError("분석 저장 전에 인증 상태가 변경되었습니다.")
+        return persist_owned_result(db, shared_db, user, context["project_id"], run_id, shaped)
 
 
 def _merge_state(target: dict, source: dict) -> None:

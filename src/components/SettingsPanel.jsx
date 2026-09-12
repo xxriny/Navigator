@@ -171,64 +171,46 @@ export default function SettingsPanel({ onShowPricing }) {
   const [ghError, setGhError] = useState("");
 
   const pollTimerRef = useRef(null);
-  const expireTimerRef = useRef(null);
-  const pollIntervalRef = useRef(5000);
-
+  const deviceAttemptRef = useRef(0);
   useEffect(() => () => {
-    clearInterval(pollTimerRef.current);
-    clearTimeout(expireTimerRef.current);
+    deviceAttemptRef.current++;
+    clearTimeout(pollTimerRef.current);
+    useAppStore.getState().cancelGithubDeviceFlow();
   }, []);
 
-  const GH_ERRORS = {
-    access_denied: "인증이 취소되었습니다. GitHub에서 승인을 거부했습니다.",
-    expired_token: "인증 코드가 만료되었습니다. 다시 시도하세요.",
-    incorrect_client_credentials: "OAuth 클라이언트 설정이 잘못되었습니다.",
+  const stopPolling = (message = "") => {
+    deviceAttemptRef.current++;
+    clearTimeout(pollTimerRef.current);
+    useAppStore.getState().cancelGithubDeviceFlow();
+    setDeviceFlowData(null); setGhPolling(false); setGhError(message);
   };
-
-  const stopPolling = (errMsg = null) => {
-    clearInterval(pollTimerRef.current);
-    clearTimeout(expireTimerRef.current);
-    setDeviceFlowData(null);
-    setGhPolling(false);
-    if (errMsg) setGhError(errMsg);
-  };
-
   const startGithubLogin = async () => {
-    clearInterval(pollTimerRef.current);
-    clearTimeout(expireTimerRef.current);
-    setGhError("");
+    stopPolling();
+    const attempt = ++deviceAttemptRef.current;
+    const current = () => deviceAttemptRef.current === attempt;
+    setGhPolling(true);
     try {
       const data = await startGithubDeviceFlow();
+      if (!current()) return;
       setDeviceFlowData(data);
-      window.open(data.verification_uri, "_blank");
-      setGhPolling(true);
-      pollIntervalRef.current = (data.interval || 5) * 1000;
-
-      const doPoll = async () => {
-        try {
+      window.open(data.verification_uri, "_blank", "noopener,noreferrer");
+      const schedule = (seconds) => {
+        pollTimerRef.current = setTimeout(async () => {
+          if (!current()) return;
           const result = await pollGithubDeviceFlow(data.device_code);
-          if (result.access_token) {
-            stopPolling();
-          } else if (result.status === "error") {
-            stopPolling(GH_ERRORS[result.error] || result.error || "인증 실패");
-          } else if (result.error === "slow_down") {
-            clearInterval(pollTimerRef.current);
-            pollIntervalRef.current += 5000;
-            pollTimerRef.current = setInterval(doPoll, pollIntervalRef.current);
-          }
-        } catch (_) {}
+          if (!current()) return;
+          if (result.status === "ok") stopPolling();
+          else if (result.status === "error") {
+            const messages = {access_denied: "GitHub 인증이 취소되었습니다.",
+              expired_token: "인증 코드가 만료되었습니다. 다시 시작해주세요.",
+              incorrect_client_credentials: "서버의 GitHub OAuth 설정을 확인해주세요."};
+            stopPolling(messages[result.error] || result.error || "인증 실패");
+          } else schedule(result.interval || data.interval);
+        }, seconds * 1000);
       };
-
-      pollTimerRef.current = setInterval(doPoll, pollIntervalRef.current);
-
-      expireTimerRef.current = setTimeout(() => {
-        stopPolling("인증 코드가 만료되었습니다. 다시 시도하세요.");
-      }, (data.expires_in || 900) * 1000);
-    } catch (e) {
-      setGhError(e.message);
-    }
+      schedule(data.interval);
+    } catch (error) { if (current()) stopPolling(error.message); }
   };
-
   const cancelGithubLogin = () => stopPolling();
 
   const inputCls = `w-full px-3 py-2 text-sm border rounded-lg focus:outline-none focus:border-[var(--accent)] transition-colors placeholder-[var(--text-muted)] ${

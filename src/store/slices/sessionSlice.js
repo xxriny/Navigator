@@ -1,13 +1,47 @@
 import { sessionService } from "../../api/services/sessionService";
-import { loadSessions, persistSessions, cloneViewportTab, normalizeOutputTabId, extractRunId, spreadResultData, EMPTY_RESULT_FIELDS } from "../storeHelpers";
+import { loadSessions, persistSessions, ownsLocalSession, cloneViewportTab, normalizeOutputTabId, extractRunId, spreadResultData, EMPTY_RESULT_FIELDS } from "../storeHelpers";
 
 // 활성 세션이 없을 때 채팅/팝오버 메모를 묶어두는 폴백 세션 키.
 // 백엔드 memo_db는 session_id 형식을 강제하지 않으므로 안전한 임의 문자열을 사용.
 const CHAT_GLOBAL_SESSION_ID = "chat_global";
 
+const projectRegistrations = new Map();
+
+// Async memo results belong to the account, team and local project that started them.
+const sameMemoContext = (a, b) => a.authGeneration === b.authGeneration && a.authToken === b.authToken &&
+  a.currentUser?.id === b.currentUser?.id && a.currentUser?.team_id === b.currentUser?.team_id &&
+  a.currentSessionId === b.currentSessionId && a.backendPort === b.backendPort;
+
 export const createSessionSlice = (set, get) => ({
-  sessions: loadSessions(),
+  sessions: [],
   currentSessionId: null,
+  serverSessionId: null,
+  ensureServerSession: async () => {
+    const state = get();
+    const { currentSessionId: localId, authToken, backendPort, currentUser } = state;
+    if (!localId || !authToken || !backendPort) throw new Error("프로젝트·로그인·백엔드 연결이 필요합니다.");
+    const key = JSON.stringify([localId, authToken, currentUser?.id, currentUser?.team_id, backendPort, state.serverSessionId]);
+    if (projectRegistrations.has(key)) return projectRegistrations.get(key);
+    const pending = (async () => {
+      const local = state.sessions.find((s) => s.id === localId);
+      const existingId = state.serverSessionId || local?.serverSessionId || state.resultData?.project_session_id || state.resultData?.run_id;
+      const res = existingId
+        ? await sessionService.getProject(backendPort, existingId, authToken)
+        : await sessionService.createProject(backendPort, local?.name || "새 프로젝트", currentUser?.team_id, authToken, localId);
+      if (res.status !== "ok" || !res.data?.session_id) throw new Error(res.error || "프로젝트 소유권을 확인할 수 없습니다.");
+      if (!sameMemoContext(state, get()) || get().serverSessionId !== state.serverSessionId) throw new Error("프로젝트 또는 계정이 변경되었습니다.");
+      const id = res.data.session_id;
+      set((s) => {
+        const sessions = s.sessions.map((item) => item.id === localId ? { ...item, serverSessionId: id } : item);
+        persistSessions(sessions, get().currentUser);
+        return { sessions, serverSessionId: id };
+      });
+      return id;
+    })();
+    projectRegistrations.set(key, pending);
+    try { return await pending; } finally { projectRegistrations.delete(key); }
+  },
+  memoSyncError: "",
   userComments: [],
   chatHistory: [],
   chatInput: "",
@@ -107,13 +141,16 @@ export const createSessionSlice = (set, get) => ({
 
   createSession: (initialTitle = null) => {
     const state = get();
-    const id = Date.now().toString();
+    if (!state.currentUser?.id || !state.authToken) return;
+    const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const now = new Date();
     const session = {
       id,
       name: initialTitle && initialTitle !== "새 프로젝트" ? initialTitle : `세션 ${now.toLocaleDateString("ko")} ${now.toLocaleTimeString("ko", { hour: "2-digit", minute: "2-digit" })}`,
       createdAt: now.getTime(),
       team_id: state.currentUser?.team_id || null,
+      owner_user_id: state.currentUser.id,
+      visibility: "private",
       projectFolder: state.projectFolder,
       fileTree: state.fileTree,
       openFiles: state.openFiles,
@@ -129,17 +166,18 @@ export const createSessionSlice = (set, get) => ({
     };
     set((state) => {
       const sessions = [session, ...state.sessions];
-      persistSessions(sessions);
-      return { sessions, currentSessionId: id };
+      persistSessions(sessions, get().currentUser);
+      return { sessions, currentSessionId: id, serverSessionId: null, userComments: [], memoProposals: [], memoSyncError: "" };
     });
   },
 
   saveCurrentSession: () => {
     const state = get();
-    if (!state.currentSessionId) return;
+    if (!state.currentSessionId || !state.currentUser?.id) return;
     const updated = state.sessions.map((s) => (
-      s.id === state.currentSessionId ? {
+      s.id === state.currentSessionId && ownsLocalSession(s, state.currentUser) ? {
         ...s,
+        serverSessionId: state.serverSessionId,
         projectFolder: state.projectFolder,
         fileTree: state.fileTree,
         openFiles: state.openFiles,
@@ -153,19 +191,20 @@ export const createSessionSlice = (set, get) => ({
         designSnapshotCounter: state.designSnapshotCounter,
       } : s
     ));
-    persistSessions(updated);
+    persistSessions(updated, get().currentUser);
     set({ sessions: updated });
   },
 
   loadSession: (id) => {
     const session = get().sessions.find((s) => s.id === id);
-    if (!session) return;
+    if (!ownsLocalSession(session, get().currentUser)) return;
     const viewport = cloneViewportTab(session.activeViewportTab);
     if (viewport.kind === "output") viewport.id = normalizeOutputTabId(viewport.id);
 
     // 즉시 세션 상태 반영 (RAG 복구 전 로컬 데이터 우선) + ModeBridge 닫기
     set({
       currentSessionId: id,
+      serverSessionId: session.serverSessionId || session.resultData?.project_session_id || null,
       projectFolder: session.projectFolder || null,
       fileTree: session.fileTree || [],
       openFiles: session.openFiles || [],
@@ -173,7 +212,8 @@ export const createSessionSlice = (set, get) => ({
       ...spreadResultData(session.resultData),
       chatHistory: session.chatHistory || [],
       pipelineStatus: session.resultData ? "done" : "idle",
-      userComments: session.userComments || [],
+      memoProposals: [], memoSyncError: "",
+      userComments: [], // Reload authorized saved rows; cached proposals are not analysis input.
       designSnapshots: session.designSnapshots || [],
       designSnapshotCounter: session.designSnapshotCounter || (session.designSnapshots?.length || 0),
       showOnboardingBridge: false,
@@ -184,13 +224,14 @@ export const createSessionSlice = (set, get) => ({
   },
 
   restoreSessionFromRag: async (id) => {
-    const { sessions, backendPort, _processResult } = get();
+    const context = get();
+    const { sessions, backendPort, _processResult, authToken } = context;
     const session = sessions.find(s => s.id === id);
     const runId = session?.resultData?.run_id || extractRunId(id);
-    if (!runId || !backendPort) return;
+    if (!runId || !backendPort || !ownsLocalSession(session, context.currentUser)) return;
     try {
-      const res = await sessionService.restoreSession(backendPort, runId);
-      if (res.status === "ok") {
+      const res = await sessionService.restoreSession(backendPort, runId, authToken);
+      if (res.status === "ok" && sameMemoContext(context, get()) && get().currentSessionId === id) {
         // 복원된 데이터 반영 시 현재 탭 유지
         const currentTab = get().activeViewportTab;
         _processResult(res.data);
@@ -202,139 +243,74 @@ export const createSessionSlice = (set, get) => ({
   },
 
   syncMemos: async () => {
-    const { backendPort, currentSessionId } = get();
-    if (!backendPort) return;
-    // 활성 세션이 없으면 다른 세션의 메모를 노출하지 않도록 즉시 비운다.
-    if (!currentSessionId) {
-      set({ userComments: [] });
-      return;
-    }
+    const context = get();
+    const { backendPort, currentSessionId, authToken } = context;
+    if (!currentSessionId || !authToken || !backendPort) { set({ userComments: [], memoSyncError: "프로젝트·로그인·백엔드 연결을 확인하세요." }); return false; }
     try {
-      const data = await sessionService.getMemos(backendPort, currentSessionId);
-      if (data.status !== "ok") return;
-
-      const serverItems = (data.memos || []).map((m) => ({
-        id: m.id,
-        text: m.text,
-        selectedText: m.metadata?.selected_text || "",
-        section: m.metadata?.section || "Global",
-        detail: m.metadata?.detail || "",
-        applied: !!m.metadata?.applied,
-        appliedAt: m.metadata?.applied_at || null,
-        reflectedVersion: m.metadata?.reflected_version || null,
-        createdAt: Date.now(),
-      }));
-
-      const local = get().userComments || [];
-      const inFlight = local.filter(
-        (c) => typeof c?.id === "string" && c.id.startsWith("temp_")
-      );
-
-      // 서버가 빈 목록을 반환해도 저장 완료된 로컬 메모를 날리지 않는다.
-      // (새 세션 시작 직후 syncMemos가 호출되면 서버엔 아직 없지만 로컬엔 있을 수 있음)
-      if (serverItems.length === 0 && local.some((c) => !c.id?.startsWith("temp_"))) {
-        // inFlight만 제거하고 나머지는 유지
-        set({ userComments: local.filter((c) => !c.id?.startsWith("temp_")) });
-        return;
-      }
-
-      const seenTexts = new Set(serverItems.map((s) => (s.text || "").trim()));
-      const merged = [
-        ...serverItems,
-        ...inFlight.filter((c) => !seenTexts.has((c.text || "").trim())),
-      ];
-
-      set({ userComments: merged });
+      const serverId = await get().ensureServerSession();
+      const data = await sessionService.getMemos(backendPort, serverId, authToken);
+      if (data.status !== "ok") throw new Error(data.error || "메모 조회 실패");
+      if (!sameMemoContext(context, get()) || get().serverSessionId !== serverId) return false;
+      set({ memoSyncError: "", userComments: (data.memos || []).map((m) => ({
+        id: m.id, text: m.text, selectedText: m.metadata?.selected_text || "",
+        section: m.metadata?.section || "Global", detail: m.metadata?.detail || "",
+        applied: !!m.metadata?.applied, appliedAt: m.metadata?.applied_at || null,
+        reflectedVersion: m.metadata?.reflected_version || null, createdAt: Date.now(), persisted: true,
+      })) });
+      return true;
     } catch (e) {
-      console.error("[MemoSync] Failed:", e);
+      if (!sameMemoContext(context, get())) return false;
+      set({ userComments: [], memoSyncError: `메모 목록 확인 실패: ${e.message}` });
       get().addDebugLog({ level: "error", message: "메모 동기화 실패", rawData: { error: e.message } });
+      return false;
     }
   },
 
   addComment: async (comment, opts = {}) => {
-    const { silent = false } = opts;
-    const { backendPort, currentSessionId } = get();
-    // 활성 프로젝트가 없으면 메모 자체를 저장하지 않는다 (chat_global 누적 차단).
-    if (!currentSessionId) {
-      get().addNotification("활성 프로젝트가 없어 메모를 저장하지 못했습니다.", "warning", 3000);
-      return;
-    }
-    const tempId = "temp_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
-    const sessionIdForPersist = currentSessionId;
-
-    console.log(
-      `[addComment] 진입 — backendPort=${backendPort} currentSessionId=${currentSessionId} ` +
-      `sessionIdForPersist=${sessionIdForPersist} text="${(comment?.text || "").slice(0, 50)}"`
-    );
-
-    // 1. 로컬 상태 즉시 반영 (UI 반응성)
-    set((s) => ({
-      userComments: [...s.userComments, { id: tempId, ...comment, createdAt: Date.now() }],
-    }));
-
-    // 2. 백엔드 영속화 (위 가드로 currentSessionId가 보장된 상태).
-    if (!backendPort) {
-      console.warn("[addComment] backendPort가 없어 백엔드 저장을 건너뜀 (로컬에만 보존)");
-      return;
+    const context = get();
+    const { backendPort, currentSessionId, authToken } = context;
+    if (!backendPort || !currentSessionId || !authToken) {
+      get().addNotification("프로젝트·로그인·백엔드 연결을 확인하세요. 메모는 저장되지 않았습니다.", "warning", 3000);
+      return false;
     }
     try {
-      console.log(`[addComment] POST /api/memos 시도 — session_id=${sessionIdForPersist}`);
+      const serverId = await get().ensureServerSession();
       const res = await sessionService.addMemo(backendPort, {
-        session_id: sessionIdForPersist,
-        text: comment.text,
-        selected_text: comment.selectedText || "",
-        section: comment.section || "Global",
-        detail: comment.detail || "",
-      });
-      console.log(`[addComment] POST 응답:`, res);
-
-      if (res.status === "ok") {
-        // 서버에서 생성된 진짜 ID로 교체
-        set((s) => ({
-          userComments: s.userComments.map((c) =>
-            c.id === tempId ? { ...c, id: res.memo_id } : c
-          ),
-        }));
-        if (!silent) {
-          get().addNotification("메모가 저장되었습니다.", "success");
-        }
-      } else {
-        // status가 "ok"가 아닌 응답 — 백엔드가 에러 응답을 보낸 경우
-        console.warn("[addComment] 서버 응답이 ok가 아님:", res);
-        get().addNotification(
-          `메모 저장 응답 오류: ${res?.error || "unknown"}`,
-          "error"
-        );
+        session_id: serverId, text: comment.text, selected_text: comment.selectedText || "",
+        section: comment.section || "Global", detail: comment.detail || "",
+      }, authToken);
+      if (res.status !== "ok" || !res.memo_id) throw new Error(res.error || "저장 결과를 확인할 수 없습니다.");
+      if (!sameMemoContext(context, get())) return false;
+      {
+        set((state) => ({ userComments: [...state.userComments.filter((c) => c.id !== res.memo_id),
+          { ...comment, id: res.memo_id, createdAt: Date.now(), persisted: true }] }));
       }
+      if (!opts.silent) get().addNotification("메모가 저장되었습니다.", "success");
+      return true;
     } catch (e) {
-      console.error("[addComment] POST 실패:", e);
-      get().addDebugLog({ level: "error", message: "메모 서버 저장 실패", rawData: { error: e.message } });
-      // 백엔드 저장 실패도 사용자에게 즉시 알림 (조용히 묻히지 않도록)
-      get().addNotification(`메모 저장 실패: ${e?.message || e}`, "error");
+      if (!sameMemoContext(context, get())) return false;
+      get().addNotification(`메모 저장 실패: ${e.message}`, "error");
+      return false;
     }
   },
 
   removeComment: async (id) => {
-    const { backendPort } = get();
-    if (!id) return;
-
-    // 1. 로컬 상태 즉시 제거
-    set((s) => ({ userComments: s.userComments.filter(c => c.id !== id) }));
-
-    // 2. 백엔드 삭제 요청
-    if (backendPort && !id.toString().startsWith("temp_")) {
-      try {
-        const res = await sessionService.removeMemo(backendPort, id);
-        if (res.status === "ok") {
-          get().addNotification("메모가 삭제되었습니다.", "success");
-        } else {
-          throw new Error(res.error || "Unknown error");
-        }
-      } catch (e) {
-        console.error("[MemoDelete] Failed:", e);
-        get().addDebugLog({ level: "error", message: "메모 삭제 실패", rawData: { error: e.message, id } });
-        get().syncMemos(); // 오류 발생 시 서버 상태와 다시 맞춤
+    const context = get();
+    const { backendPort, currentSessionId, authToken } = context;
+    if (!id || !backendPort || !authToken) return false;
+    try {
+      const res = await sessionService.removeMemo(backendPort, id, authToken);
+      if (res.status !== "ok") throw new Error(res.error || "메모 삭제 실패");
+      if (!sameMemoContext(context, get())) return false;
+      {
+        set((state) => ({ userComments: state.userComments.filter((c) => c.id !== id) }));
       }
+      get().addNotification("메모가 삭제되었습니다.", "success");
+      return true;
+    } catch (e) {
+      if (!sameMemoContext(context, get())) return false;
+      get().addNotification(`메모 삭제 실패: ${e.message}`, "error");
+      return false;
     }
   },
 
@@ -344,16 +320,16 @@ export const createSessionSlice = (set, get) => ({
    * 실패해도 사용자 흐름을 막지 않는다 (백엔드 일시 장애 등).
    */
   markMemosApplied: async (memoIds, opts = {}) => {
-    const { backendPort } = get();
+    const { backendPort, currentSessionId, authToken } = get();
     if (!Array.isArray(memoIds) || memoIds.length === 0) return;
     const reflectedVersion = opts.reflectedVersion || null;
-    if (!backendPort) {
+    if (!backendPort || !authToken) {
       console.warn("[markMemosApplied] backendPort 없어 백엔드 갱신 스킵");
       return;
     }
     try {
-      const res = await sessionService.applyMemos(backendPort, memoIds, reflectedVersion);
-      if (res?.status === "ok") {
+      const res = await sessionService.applyMemos(backendPort, memoIds, reflectedVersion, authToken);
+      if (res?.status === "ok" && get().currentSessionId === currentSessionId && get().authToken === authToken) {
         const ts = new Date().toISOString();
         set((s) => ({
           userComments: (s.userComments || []).map((c) =>
@@ -367,17 +343,19 @@ export const createSessionSlice = (set, get) => ({
               : c
           ),
         }));
+        return true;
       } else {
-        console.warn("[markMemosApplied] 백엔드 응답 비정상:", res);
+        throw new Error(res?.error || "메모 보관 결과를 확인할 수 없습니다.");
       }
     } catch (e) {
-      console.error("[markMemosApplied] 실패:", e);
+      get().addNotification(`메모 보관 실패: ${e.message}`, "error");
       get().addDebugLog?.({
         level: "error",
         message: "메모 applied 표시 실패",
         rawData: { error: e?.message, ids: memoIds },
       });
     }
+    return false;
   },
 
   setChatInput: (text) => set({ chatInput: text }),
@@ -390,6 +368,7 @@ export const createSessionSlice = (set, get) => ({
   startNewProject: () => {
     set({
       currentSessionId: null,
+      serverSessionId: null,
       chatHistory: [],
       chatInput: "",
       userComments: [],
@@ -417,8 +396,8 @@ export const createSessionSlice = (set, get) => ({
 
   updateSessionName: (id, name) => {
     set((state) => {
-      const updated = state.sessions.map((s) => (s.id === id ? { ...s, name } : s));
-      persistSessions(updated);
+      const updated = state.sessions.map((s) => (s.id === id && ownsLocalSession(s, state.currentUser) ? { ...s, name } : s));
+      persistSessions(updated, get().currentUser);
       return { sessions: updated };
     });
   },

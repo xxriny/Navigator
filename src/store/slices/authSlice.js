@@ -3,7 +3,7 @@
  * 로그인/로그아웃, 현재 사용자, 역할/플랜 정보
  */
 
-import { EMPTY_RESULT_FIELDS } from "../storeHelpers";
+import { EMPTY_RESULT_FIELDS, loadSessions } from "../storeHelpers";
 import { serverRequest, SERVER_URL } from "../../api/serverClient";
 
 const AUTH_KEY = "navigator_auth";
@@ -27,6 +27,19 @@ function clearStoredAuth() {
 }
 
 const stored = loadStoredAuth();
+const workspaceKey = (user, teamId = user?.team_id) => JSON.stringify([user?.id, teamId || null]);
+const emptyWorkspace = () => ({
+  ...EMPTY_RESULT_FIELDS, resultData: null, sessions: [], currentSessionId: null, serverSessionId: null,
+  chatHistory: [], chatInput: "", userComments: [], memoProposals: [], memoSyncError: "",
+  designSnapshots: [], designSnapshotCounter: 0, snapshots: [], activeSnapshot: null, localResults: [],
+  pipelineStatus: "idle", pipelineError: null, pipelineNodes: {}, thinkingLog: [], agileImpactResult: null,
+  lastIdeaReady: false, lastIdeaSummary: "", lastSuggestedMode: null, lastFollowups: [],
+  _syncInFlight: false, _syncMemoIdsForApply: [], _syncTargetVersion: null, analysisOwnerTeamId: null,
+  activeViewportTab: {kind: "output", id: "home"}, activeIconPanel: null, showOnboardingBridge: true,
+  projectFolder: null, fileTree: [], openFiles: [], publishError: null,
+  devTrackingResult: null, devTrackingAnalyses: [], devTrackingForm: null,
+  devTrackingRunning: false, devTrackingRunError: "", debugLogs: [],
+});
 
 export const createAuthSlice = (set, get) => ({
   // ── 상태 ────────────────────────────────────────────────
@@ -35,6 +48,9 @@ export const createAuthSlice = (set, get) => ({
   userRole: stored.user?.role ?? null,
   userPlan: stored.user?.plan ?? "free",
   authChecked: false,
+  authStatus: stored.token ? "checking" : "unauthenticated",
+  authGeneration: 0,
+  githubDeviceAttempt: null,
   hasUsers: null,
   myTeams: [],           // 다중 팀 목록
   teamWorkspaces: {},    // { [teamId]: parked workspace snapshot }
@@ -42,21 +58,36 @@ export const createAuthSlice = (set, get) => ({
 
   // ── 액션 ────────────────────────────────────────────────
   setAuth: (token, user) => {
+    const previous = get();
+    const accountChanged = previous.currentUser?.id !== user?.id;
+    const boundaryChanged = accountChanged || previous.currentUser?.team_id !== user?.team_id;
+    const changed = boundaryChanged || previous.authToken !== token;
+    if (boundaryChanged) previous.saveCurrentSession?.();
     saveAuth(token, user);
     set({
-      authToken: token,
-      currentUser: user,
-      userRole: user?.role ?? null,
-      userPlan: user?.plan ?? "free",
+      ...(boundaryChanged ? emptyWorkspace() : {}),
+      ...(boundaryChanged ? {sessions: loadSessions(user)} : {}),
+      ...(accountChanged ? {teamWorkspaces: {}, myTeams: [], githubToken: "", githubOwner: "", githubRepo: "", githubBranch: "main"} : {}),
+      ...(changed ? {githubDeviceAttempt: null, userComments: [], memoProposals: [], memoSyncError: ""} : {}),
+      authGeneration: (previous.authGeneration || 0) + (changed ? 1 : 0),
+      authToken: token, currentUser: user, authStatus: "authenticated",
+      userRole: user?.role ?? null, userPlan: user?.plan ?? "free",
     });
+    if (boundaryChanged) get().loadGithubSettings?.(user);
+    if (changed) { get().resetPipelineRuntime?.(); get().resetWebSocket?.(); }
   },
 
   clearAuth: () => {
+    const previous = get();
+    previous.saveCurrentSession?.();
     clearStoredAuth();
-    set({ authToken: null, currentUser: null, userRole: null, userPlan: "free" });
+    set({ ...emptyWorkspace(), githubDeviceAttempt: null, authToken: null, currentUser: null, userRole: null, userPlan: "free",
+      authStatus: "unauthenticated", authGeneration: (previous.authGeneration || 0) + 1,
+      teamWorkspaces: {}, myTeams: [], githubToken: "", githubOwner: "", githubRepo: "", githubBranch: "main" });
+    get().resetPipelineRuntime?.(); get().resetWebSocket?.();
   },
 
-  isAuthenticated: () => !!get().authToken,
+  isAuthenticated: () => !!get().authToken && get().authStatus === "authenticated",
 
   setAuthChecked: (checked) => set({ authChecked: checked }),
   setHasUsers: (v) => set({ hasUsers: v }),
@@ -69,47 +100,46 @@ export const createAuthSlice = (set, get) => ({
 
   /** 앱 시작 시 서버에서 사용자 존재 여부 확인 */
   checkAuthStatus: async () => {
-    const { authToken } = get();
+    const { authToken, authGeneration } = get();
+    const unchanged = () => get().authToken === authToken && get().authGeneration === authGeneration;
     try {
-      const [statusRes, meRes] = await Promise.all([
-        fetch(`${SERVER_URL}/auth/status`),
-        authToken
-          ? fetch(`${SERVER_URL}/auth/me`, { headers: get().getAuthHeader() })
-          : Promise.resolve(null),
+      const [statusData, me] = await Promise.all([
+        serverRequest("/auth/status"),
+        authToken ? serverRequest("/auth/me", {headers: {Authorization: `Bearer ${authToken}`}}) : null,
       ]);
-
-      const statusData = await statusRes.json();
-      set({ hasUsers: statusData.has_users, authChecked: true });
-
-      if (meRes) {
-        if (!meRes.ok) {
-          get().clearAuth();
-        } else {
-          const meData = await meRes.json();
-          get().setAuth(get().authToken, meData);
-        }
-      }
-    } catch {
-      set({ authChecked: true });
+      if (!unchanged()) return;
+      set({hasUsers: statusData.has_users, authChecked: true});
+      if (me) {
+        get().setAuth(authToken, me);
+        // A restored auth cache does not imply that the account's session cache was loaded.
+        if (!get().currentSessionId) { set({sessions: loadSessions(me)}); get().loadGithubSettings?.(me); }
+      } else set({authStatus: "unauthenticated"});
+    } catch (error) {
+      if (unchanged()) set({authChecked: true, authStatus: error.status === 401 ? "unauthenticated" : "unavailable"});
+      else if (!get().authToken) set({authChecked: true});
     }
   },
 
   /** 로그인 */
   login: async (email, password) => {
+    const generation = get().authGeneration;
     const data = await serverRequest("/auth/login", {
       method: "POST",
       body: JSON.stringify({ email, password }),
     });
+    if (get().authGeneration !== generation) throw new Error("로그인 상태가 변경되었습니다. 다시 시도해주세요.");
     get().setAuth(data.access_token, data.user);
     return data.user;
   },
 
   /** 회원가입 */
   register: async (payload) => {
+    const generation = get().authGeneration;
     const data = await serverRequest("/auth/register", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    if (get().authGeneration !== generation) throw new Error("로그인 상태가 변경되었습니다. 다시 시도해주세요.");
     get().setAuth(data.access_token, data.user);
     set({ hasUsers: true });
     return data.user;
@@ -122,16 +152,16 @@ export const createAuthSlice = (set, get) => ({
 
   /** 팀 생성 (로그인 후 팀이 없는 사용자) */
   createTeam: async (teamName) => {
+    const context = get();
+    const headers = context.getAuthHeader();
+    await serverRequest("/auth/teams", {method: "POST", headers, body: JSON.stringify({name: teamName})});
+    if (get().authGeneration !== context.authGeneration) return;
+    const me = await serverRequest("/auth/me", {headers});
+    if (get().authGeneration !== context.authGeneration) return;
     get()._parkCurrentWorkspace();
-    await serverRequest("/auth/teams", {
-      method: "POST",
-      headers: get().getAuthHeader(),
-      body: JSON.stringify({ name: teamName }),
-    });
-    const me = await serverRequest("/auth/me", { headers: get().getAuthHeader() });
-    get().setAuth(get().authToken, me);
+    get().setAuth(context.authToken, me);
     get()._restoreWorkspace(me.team_id);
-    get().loadMyTeams();
+    await get().loadMyTeams();
     return me;
   },
 
@@ -140,8 +170,9 @@ export const createAuthSlice = (set, get) => ({
     const { isAuthenticated, getAuthHeader } = get();
     if (!isAuthenticated()) return;
     try {
+      const generation = get().authGeneration;
       const data = await serverRequest("/auth/users/me/teams", { headers: getAuthHeader() });
-      set({ myTeams: data.teams || [] });
+      if (get().authGeneration === generation) set({ myTeams: data.teams || [] });
     } catch (e) {
       console.error("Failed to load my teams", e);
     }
@@ -151,7 +182,7 @@ export const createAuthSlice = (set, get) => ({
   _workspaceFields: [
     "pipelineStatus", "pipelineError", "pipelineNodes", "thinkingLog",
     "agileImpactResult",
-    "currentSessionId", "userComments", "chatHistory", "chatInput",
+    "currentSessionId", "serverSessionId", "userComments", "chatHistory", "chatInput",
     "activeViewportTab", "activeIconPanel",
     "snapshots", "activeSnapshot", "localResults", "publishError",
     ...Object.keys(EMPTY_RESULT_FIELDS),
@@ -162,78 +193,38 @@ export const createAuthSlice = (set, get) => ({
     const s = get();
     const teamId = s.currentUser?.team_id;
     if (!teamId) return;
-    const snapshot = {};
+    s.saveCurrentSession?.();
+    const snapshot = {ownerUserId: s.currentUser.id};
     for (const f of s._workspaceFields) snapshot[f] = s[f];
-    // 팀 전용 세션 목록도 파킹
-    snapshot._sessions = (s.sessions || []).filter(
-      (sess) => !sess.team_id || sess.team_id === teamId
-    );
-    set((prev) => ({
-      teamWorkspaces: { ...prev.teamWorkspaces, [teamId]: snapshot },
-    }));
+    snapshot._sessions = (s.sessions || []).filter(sess =>
+      sess.owner_user_id === s.currentUser.id && (sess.team_id || null) === (teamId || null));
+    set(prev => ({teamWorkspaces: {...prev.teamWorkspaces, [workspaceKey(s.currentUser)]: snapshot}}));
   },
 
-  /** teamWorkspaces에서 팀 상태 복원, 없으면 빈 상태 */
   _restoreWorkspace: (teamId) => {
-    const parked = get().teamWorkspaces[teamId];
-    const BLANK_WORKSPACE = {
-      pipelineStatus: "idle", pipelineError: null, pipelineNodes: {}, thinkingLog: [],
-      agileImpactResult: null,
-      currentSessionId: null, userComments: [], chatHistory: [], chatInput: "",
-      activeViewportTab: { kind: "output", id: "home" }, activeIconPanel: null,
-      snapshots: [], activeSnapshot: null, localResults: [], publishError: null,
-      ...EMPTY_RESULT_FIELDS,
-    };
-    const workspace = parked || BLANK_WORKSPACE;
-    const { _sessions, ...rest } = workspace;
-    set((s) => ({
-      ...rest,
-      sessions: _sessions || (s.sessions || []).filter(
-        (sess) => !sess.team_id || sess.team_id === teamId
-      ),
-    }));
+    const user = get().currentUser;
+    if (!user?.id || (user.team_id || null) !== (teamId || null)) return;
+    const parked = get().teamWorkspaces[workspaceKey(user, teamId)];
+    const workspace = parked?.ownerUserId === user.id ? parked : emptyWorkspace();
+    const {_sessions, ownerUserId, ...rest} = workspace;
+    set({...rest, serverSessionId: rest.serverSessionId || null,
+      userComments: [], memoProposals: [], memoSyncError: "",
+      sessions: _sessions || loadSessions(user)});
   },
 
-  /** 팀 전환 (옵티미스틱: UI 즉시 전환 → API 백그라운드 확인 → 실패 시 롤백) */
+  /** 원격 팀 전환 성공 및 요청 계정 확인 후 워크스페이스 전환 */
   switchTeam: async (teamId) => {
-    const { getAuthHeader, currentUser } = get();
-    if (currentUser?.team_id === teamId) return;
-
-    // ── 1. 즉시 UI 전환 (API 기다리지 않음) ──────────────────
+    const context = get();
+    if (context.currentUser?.team_id === teamId) return;
+    const data = await serverRequest("/auth/users/me/teams/switch", {
+      method: "POST", headers: context.getAuthHeader(), body: JSON.stringify({team_id: teamId}),
+    });
+    if (get().authGeneration !== context.authGeneration) return;
     get()._parkCurrentWorkspace();
-    const prevUser = currentUser;
-
-    // 현재 사용자 정보를 팀만 바꿔서 임시 적용
-    const optimisticUser = { ...currentUser, team_id: teamId };
-    get().setAuth(get().authToken, optimisticUser);
-    get()._restoreWorkspace(teamId);
-
-    const isFirstVisit = !get().teamWorkspaces[teamId];
-
-    // 팀 목록 + 첫 방문 시 스냅샷·로컬결과를 모두 병렬로 fire-and-forget
-    Promise.all([
-      get().loadMyTeams(),
-      ...(isFirstVisit ? [get().loadSnapshots(), get().loadLocalResults()] : []),
-    ]);
-
-    // ── 2. 백그라운드에서 서버 확인 ──────────────────────────
-    try {
-      const data = await serverRequest("/auth/users/me/teams/switch", {
-        method: "POST",
-        headers: getAuthHeader(),
-        body: JSON.stringify({ team_id: teamId }),
-      });
-      // 서버에서 받은 정확한 유저 정보로 교체 (role 등 반영)
-      get().setAuth(get().authToken, data.user);
-      return data.user;
-    } catch (e) {
-      // ── 3. 실패 시 롤백 ────────────────────────────────────
-      get()._parkCurrentWorkspace();
-      get().setAuth(get().authToken, prevUser);
-      get()._restoreWorkspace(prevUser.team_id);
-      get().addNotification(`팀 전환 실패: ${e.message}`, "error");
-      throw e;
-    }
+    get().setAuth(context.authToken, data.user);
+    get()._restoreWorkspace(data.user.team_id);
+    await get().loadMyTeams();
+    return data.user;
   },
 
   /** GitHub OAuth Web Flow: 인증 URL + session_id 가져오기 */
@@ -256,27 +247,74 @@ export const createAuthSlice = (set, get) => ({
     }
   },
 
-  /** GitHub Device Flow 시작 */
+  /** Device Flow uses the Cloud server's public OAuth client configuration. */
+  cancelGithubDeviceFlow: () => set({githubDeviceAttempt: null}),
+
   startGithubDeviceFlow: async () => {
-    return await serverRequest("/auth/github/device/start", { method: "POST" });
+    const context = get();
+    const attempt = {generation: context.authGeneration, token: context.authToken,
+      userId: context.currentUser?.id, inFlight: false};
+    set({githubDeviceAttempt: attempt});
+    try {
+      const data = await serverRequest("/auth/github/device/start", {method: "POST"});
+      if (get().githubDeviceAttempt !== attempt || get().authGeneration !== attempt.generation)
+        throw new Error("인증 요청이 취소되었습니다.");
+      if (typeof data.device_code !== "string" || !data.device_code ||
+          typeof data.user_code !== "string" || !data.user_code ||
+          data.verification_uri !== "https://github.com/login/device" ||
+          !Number.isInteger(data.interval) || data.interval <= 0 ||
+          !Number.isInteger(data.expires_in) || data.expires_in <= 0)
+        throw new Error("GitHub 인증 응답을 확인할 수 없습니다.");
+      Object.assign(attempt, {code: data.device_code, interval: data.interval,
+        expiresAt: Date.now() + data.expires_in * 1000, nextPollAt: Date.now() + data.interval * 1000});
+      return data;
+    } catch (error) {
+      if (get().githubDeviceAttempt === attempt) set({githubDeviceAttempt: null});
+      throw error;
+    }
   },
 
-  /** GitHub Device Flow 폴링 */
   pollGithubDeviceFlow: async (device_code) => {
+    const attempt = get().githubDeviceAttempt;
+    const current = () => attempt && get().githubDeviceAttempt === attempt &&
+      get().authGeneration === attempt.generation && get().authToken === attempt.token;
+    if (!current() || attempt.code !== device_code) return {status: "error", error: "인증 요청이 취소되었습니다."};
+    if (Date.now() >= attempt.expiresAt) {
+      set({githubDeviceAttempt: null});
+      return {status: "error", error: "expired_token"};
+    }
+    if (attempt.inFlight || Date.now() < attempt.nextPollAt)
+      return {status: "pending", interval: attempt.interval};
+    attempt.inFlight = true;
     try {
       const data = await serverRequest("/auth/github/device/poll", {
-        method: "POST",
-        headers: get().getAuthHeader(),
-        body: JSON.stringify({ device_code }),
+        method: "POST", headers: attempt.token ? {Authorization: `Bearer ${attempt.token}`} : {},
+        body: JSON.stringify({device_code}),
       });
-      if (data.access_token) {
-        get().setAuth(data.access_token, data.user);
-        set({ hasUsers: true });
+      if (!current()) return {status: "error", error: "인증 요청이 취소되었습니다."};
+      if (Date.now() >= attempt.expiresAt) {
+        set({githubDeviceAttempt: null});
+        return {status: "error", error: "expired_token"};
       }
-      return data;
-    } catch (e) {
-      return { status: "error", error: e.message };
-    }
+      if (typeof data.access_token === "string" && data.access_token && data.user?.id) {
+        if (attempt.token && data.user.id !== attempt.userId)
+          throw new Error("GitHub 연결 대상 계정이 일치하지 않습니다.");
+        get().setAuth(data.access_token, data.user);
+        set({hasUsers: true, githubDeviceAttempt: null});
+        return {...data, status: "ok"};
+      }
+      if (data.error === "authorization_pending" || data.error === "slow_down") {
+        if (data.error === "slow_down") attempt.interval = Math.max(attempt.interval + 5,
+          Number.isInteger(data.interval) ? data.interval : 0);
+        attempt.nextPollAt = Date.now() + attempt.interval * 1000;
+        return {status: "pending", error: data.error, interval: attempt.interval};
+      }
+      set({githubDeviceAttempt: null});
+      return {status: "error", error: data.error || "GitHub 인증 응답을 확인할 수 없습니다."};
+    } catch (error) {
+      if (current()) set({githubDeviceAttempt: null});
+      return {status: "error", error: error.message};
+    } finally { attempt.inFlight = false; }
   },
 
   disconnectGithub: async () => {

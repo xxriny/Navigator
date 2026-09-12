@@ -12,20 +12,20 @@ def _now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 from typing import Optional
 
-from sqlalchemy import Column, String, Text, DateTime, create_engine, text
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from sqlalchemy import Column, String, Text, DateTime, text
+from sqlalchemy.orm import DeclarativeBase
 import os
 from observability.logger import get_logger
 
-_STORAGE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
-    "storage",
+# Share the configured database with authenticated approval and manual APIs.
+# Keep existing private aliases for callers; task schema and CRUD contracts stay unchanged.
+from auth.database import (
+    engine as _engine,
+    SessionLocal as _Session,
+    LOCAL_DB_PATH as _DB_PATH,
+    LOCAL_DB_URL as _DB_URL,
+    _STORAGE_DIR,
 )
-_DB_PATH = os.path.join(_STORAGE_DIR, "local.db")
-_DB_URL = f"sqlite:///{_DB_PATH}"
-
-_engine = create_engine(_DB_URL, connect_args={"check_same_thread": False})
-_Session = sessionmaker(bind=_engine)
 
 
 class _Base(DeclarativeBase):

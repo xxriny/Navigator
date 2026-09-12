@@ -11,6 +11,15 @@ let _thinkingBuf = [];
 let _thinkingTimer = null;
 
 export const createPipelineSlice = (set, get) => ({
+  resetPipelineRuntime: () => {
+    if (_thinkingTimer) clearTimeout(_thinkingTimer);
+    _thinkingTimer = null;
+    _thinkingBuf = [];
+  },
+  memoProposals: [],
+  dismissMemoProposal: (id) => set((state) => ({
+    memoProposals: state.memoProposals.filter((p) => p.proposal_id !== id),
+  })),
   pipelineStatus: "idle",
   pipelineError: null,
   pipelineNodes: {},
@@ -173,56 +182,20 @@ export const createPipelineSlice = (set, get) => ({
           : [],
       });
 
-      // 채팅에서 생성된 자동 메모(notes_to_add)를 userComments에 머지.
-      // 백엔드(pipeline_runner)가 이미 SQLite에 영속화했으므로 여기서는 로컬 상태만 갱신.
-      // id 기준 dedupe — 동일 frame 재도달 또는 syncMemos 결과와 겹치는 경우 대비.
-      const notes = data.notes_to_add || [];
-      if (notes.length > 0) {
-        const existingIds = new Set((get().userComments || []).map((c) => c.id));
-        const newMemos = notes
-          .filter((n) => n && n.id && !existingIds.has(n.id))
-          .map((n) => ({
-            id: n.id,
-            text: n.text || "",
-            selectedText: n.selected_text || "",
-            section: n.section || "Idea Chat",
-            detail: n.detail || "",
-            applied: false,
-            appliedAt: null,
-            createdAt: Date.now(),
-          }));
-        if (newMemos.length > 0) {
-          set((state) => ({ userComments: [...state.userComments, ...newMemos] }));
-          // 사용자에게 추가 알림 (2.5초 자동 dismiss)
-          get().addNotification(`메모 ${newMemos.length}건이 추가되었습니다.`, "success", 2500);
-          // race-avoidance: MemoManager 마운트 시 시작된 syncMemos가 늦게 응답해
-          // 방금 push한 항목을 덮어쓰지 않도록, 짧은 지연 뒤 서버 스냅샷과 강제 정합.
-          // (백엔드가 이미 persist했으므로 server fetch에 동일 id가 포함됨)
-          setTimeout(() => { get().syncMemos(); }, 250);
-        }
+      // Review candidates never enter userComments or update-analysis inputs.
+      const proposal = data.memo_proposal;
+      if (proposal && proposal.actor_id === get().currentUser?.id) {
+        set((state) => ({ memoProposals: [
+          ...state.memoProposals.filter((p) => p.proposal_id !== proposal.proposal_id && p.expires_at * 1000 > Date.now()),
+          proposal,
+        ] }));
+        get().addNotification("메모 제안이 있습니다. 메모 관리에서 검토 후 저장하세요.", "info", 4000);
       }
+      if (data.memo_proposal_error) get().addNotification(data.memo_proposal_error, "warning", 5000);
       return;
     }
 
-    // AI 어드바이저 제안사항을 메모로 자동 변환
-    const recommendations = data.recommendations || data.sa_advisor_output?.recommendations || [];
-    if (recommendations.length > 0) {
-      const existingTexts = new Set(get().userComments.map(c => c.text));
-      const newMemos = recommendations
-        .filter(r => !existingTexts.has(r.action))
-        .map(r => ({
-          id: `auto_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-          text: r.action,
-          selectedText: r.target,
-          section: `Advisor (${r.priority})`,
-          createdAt: Date.now(),
-        }));
-      
-      if (newMemos.length > 0) {
-        // 백엔드에도 동기화 (선택 사항, 여기서는 로컬 UI 우선 반영)
-        set((state) => ({ userComments: [...state.userComments, ...newMemos] }));
-      }
-    }
+    // Advisor recommendations remain in the analysis result until explicitly saved by the user.
 
     // UPDATE 모드에서 components/apis/tables는 백엔드 결과를 그대로 사용.
     // 백엔드 component_scheduler/sa_unified_modeler의 UPDATE_PROMPT가 이미
@@ -267,19 +240,16 @@ export const createPipelineSlice = (set, get) => ({
 
       // 메모 일괄 archive — 로컬은 markMemosApplied 내부에서 패치, 서버 영속화도 동시
       if (memoIdsForApply.length > 0) {
-        get().markMemosApplied(memoIdsForApply, { reflectedVersion: targetVersion });
-        get().addNotification(
-          `${targetVersion} 반영 완료 · 메모 ${memoIdsForApply.length}건 보관`,
-          "success",
-          3000
-        );
+        get().markMemosApplied(memoIdsForApply, { reflectedVersion: targetVersion }).then((saved) => {
+          if (saved) get().addNotification(`${targetVersion} 반영 완료 · 메모 ${memoIdsForApply.length}건 보관`, "success", 3000);
+        });
       } else {
         get().addNotification(`${targetVersion} 반영 완료`, "success", 3000);
       }
     }
   },
 
-  startAnalysis: (idea, context = "", apiKey = "", model = "gemini-3.1-flash-lite", selectedMode = "create", initialTitle = null) => {
+  startAnalysis: async (idea, context = "", apiKey = "", model = "gemini-3.1-flash-lite", selectedMode = "create", initialTitle = null) => {
     const { currentUser } = get();
     if (!currentUser?.github_id) {
       get().addNotification("GitHub 로그인이 필요합니다. 설정에서 연결하세요.", "error");
@@ -292,6 +262,9 @@ export const createPipelineSlice = (set, get) => ({
     const normalizedMode = normalizeMode(selectedMode);
     const sourceDir = get().projectFolder || "";
     get().createSession(initialTitle);
+    let serverId;
+    try { serverId = await get().ensureServerSession(); }
+    catch (e) { get().addNotification(e.message, "error"); return; }
     // 분석 시작한 팀 등록 (팀 전환 시 백그라운드 라우팅에 사용)
     set({ analysisOwnerTeamId: currentUser?.team_id || null });
 
@@ -312,7 +285,7 @@ export const createPipelineSlice = (set, get) => ({
       lastOutputTab: "progress",
     });
     get().sendWsMessage("analyze", {
-      idea, context, api_key: apiKey, model,
+      idea, context, api_key: apiKey, model, project_session_id: serverId,
       action_type: MODE_TO_ACTION_TYPE[normalizedMode],
       source_dir: sourceDir,
       auth_token: get().authToken,
@@ -347,7 +320,7 @@ export const createPipelineSlice = (set, get) => ({
       .filter((m) => m && (m.role === "user" || m.role === "assistant"))
       .map((m) => ({ role: m.role, content: m.content || "" }));
     const activeMemos = (userComments || [])
-      .filter((c) => !c.applied)
+      .filter((c) => c.persisted === true && !c.applied)
       .map((c) => ({
         text: c.text || "",
         section: c.section || "",
@@ -387,7 +360,7 @@ export const createPipelineSlice = (set, get) => ({
    *   ideaOverride: SyncConfirmModal이 Pre-flight 요약(노이즈 제거된 마크다운)을
    *   넘겨주면 그 텍스트를 idea로 사용한다. 미지정 시 기존처럼 날것 대화/메모를 합성.
    */
-  runSyncUpdate: (opts = {}) => {
+  runSyncUpdate: async (opts = {}) => {
     const { currentUser } = get();
     if (!currentUser?.github_id) {
       get().addNotification("GitHub 로그인이 필요합니다. 설정에서 연결하세요.", "error");
@@ -410,6 +383,10 @@ export const createPipelineSlice = (set, get) => ({
       resultData,
     } = get();
 
+    let serverId;
+    try { serverId = await get().ensureServerSession(); }
+    catch (e) { get().addNotification(e.message, "error"); return; }
+
     // 0) 첫 빌드 여부 판별 — 산출물(resultData)이 아직 없으면 CREATE, 있으면 UPDATE.
     //    designSnapshots는 첫 빌드 시 push되지 않기 때문에 길이만으로 판별하면 두 번째
     //    Sync에서도 또 CREATE로 빠지는 회귀가 발생한다(버전 정체 + 롤백 마커 누락).
@@ -430,7 +407,7 @@ export const createPipelineSlice = (set, get) => ({
       .filter((m) => m && (m.role === "user" || m.role === "assistant"));
 
     // 2) 활성 메모 (applied=false)
-    const activeMemos = (userComments || []).filter((c) => !c.applied);
+    const activeMemos = (userComments || []).filter((c) => c.persisted === true && !c.applied);
 
     // 3) 둘 다 비면 호출 의미 없음
     if (chatDiff.length === 0 && activeMemos.length === 0) {
@@ -538,6 +515,7 @@ export const createPipelineSlice = (set, get) => ({
     get().sendWsMessage("analyze", {
       idea,
       context: prevContext,
+      project_session_id: serverId,
       api_key: apiKey || "",
       model: model || "gemini-3.1-flash-lite",
       action_type: actionType,
@@ -547,9 +525,12 @@ export const createPipelineSlice = (set, get) => ({
     });
   },
 
-  sendIdeaChat: (message, apiKey, model) => {
+  sendIdeaChat: async (message, apiKey, model) => {
     const text = (message || "").trim();
     if (!text) return;
+    let serverId;
+    try { serverId = await get().ensureServerSession(); }
+    catch (e) { get().addNotification(e.message, "error"); return; }
 
     // 새 메시지 송신 시 이전 후속 질문 칩은 즉시 비움 (stale 방지)
     set({ lastFollowups: [] });
@@ -571,7 +552,7 @@ export const createPipelineSlice = (set, get) => ({
       previous_result: get().resultData || {},
       api_key: apiKey || "",
       model: model || "gemini-3.1-flash-lite",
-      session_id: get().currentSessionId || "",
+      session_id: serverId,
       auth_token: get().authToken,
     });
   },

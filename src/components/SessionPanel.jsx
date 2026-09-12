@@ -1,3 +1,4 @@
+import { ownsLocalSession } from "../store/storeHelpers";
 import React, { useState } from "react";
 import useAppStore from "../store/useAppStore";
 import { Clock3, X as XIcon, Edit3, RefreshCw } from "lucide-react";
@@ -6,9 +7,7 @@ export default function SessionPanel() {
   const { sessions, currentSessionId, loadSession, deleteSession, updateSessionName, isDarkMode } = useAppStore();
   const currentUser = useAppStore((s) => s.currentUser);
   const teamId = currentUser?.team_id || null;
-  const visibleSessions = teamId
-    ? sessions.filter((s) => !s.team_id || s.team_id === teamId)
-    : sessions;
+  const visibleSessions = sessions.filter(s => ownsLocalSession(s, currentUser));
   const [editingId, setEditingId] = useState(null);
   const [editValue, setEditValue] = useState("");
 

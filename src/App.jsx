@@ -40,6 +40,7 @@ export default function App() {
 
   const authToken = useAppStore((state) => state.authToken);
   const authChecked = useAppStore((state) => state.authChecked);
+  const authStatus = useAppStore(state => state.authStatus);
   const hasUsers = useAppStore((state) => state.hasUsers);
   const currentUser = useAppStore((state) => state.currentUser);
   const userPlan = useAppStore((state) => state.userPlan);
@@ -131,6 +132,14 @@ export default function App() {
   }
 
   // authToken=false → LoginScreen
+  if (authStatus === "unavailable") {
+    return <div className="h-screen flex flex-col items-center justify-center gap-4" style={{background: "var(--bg-root)", color: "var(--text-primary)"}}>
+      <p>로그인 서버에 연결할 수 없습니다. 인터넷 연결을 확인해주세요.</p>
+      <button className="px-4 py-2 rounded bg-blue-600 text-white" onClick={() => useAppStore.getState().checkAuthStatus()}>다시 연결</button>
+      <button onClick={() => useAppStore.getState().logout()}>로그아웃</button>
+    </div>;
+  }
+
   if (!authToken) {
     return <LoginScreen isFirstRun={hasUsers === false} />;
   }

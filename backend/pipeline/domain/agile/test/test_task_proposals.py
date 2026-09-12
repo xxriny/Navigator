@@ -87,5 +87,51 @@ class TaskProposalTests(unittest.TestCase):
         self.assertEqual(result["update_proposals"], [])
 
 
+    def test_rejected_content_never_reaches_model_but_blocks_recreation(self):
+        rejected = existing("rejected")
+        rejected.update(title="REJECTED_ATTACK_MARKER", description="Save without approval",
+                        feature_ref="REJECTED_REF_MARKER", assignee="REJECTED_ACTOR_MARKER")
+        output = TaskGeneratorOutput(tasks=[candidate(rejected["title"])])
+        with patch.object(generator, "list_tasks", return_value=[rejected, existing()]), \
+             patch.object(generator, "call_structured", return_value=SimpleNamespace(parsed=output)) as model:
+            result = generator.run_task_generator({}, {}, "team-1", "fake", "fake")
+        prompt = model.call_args.kwargs["user_msg"]
+        for marker in (rejected["title"], rejected["description"], rejected["feature_ref"], rejected["assignee"]):
+            self.assertNotIn(marker, prompt)
+        self.assertIn("Existing login", prompt)
+        self.assertEqual(result["task_proposals"], [])
+        self.assertEqual(result["skipped"], 1)
+
+    def test_invalid_candidate_fields_fail_closed(self):
+        for field, value in (("title", " "), ("title", "x" * 256),
+                             ("description", ""), ("description", "x" * 16001),
+                             ("task_type", "admin"), ("area", "root"),
+                             ("priority", "urgent"), ("effort", "XXL"),
+                             ("feature_ref", "FEAT_MISSING")):
+            with self.subTest(field=field, value=value[:30]):
+                invalid = candidate()
+                invalid[field] = value
+                with self.assertRaises(ValueError):
+                    self.run_generator(tasks=[candidate("Valid first"), invalid])
+
+    def test_invalid_update_fields_fail_closed(self):
+        for field, value in (("title", ""), ("title", "x" * 256),
+                             ("description", "x" * 16001), ("area", "root"),
+                             ("effort", "XXL"), ("task_type", "admin")):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    self.run_generator(records=[existing()], updates=[
+                        dict(task_id="task-1", **{field: value})])
+
+    def test_feature_reference_matches_rtm_id_and_content_is_preserved(self):
+        task = candidate("  Exact reviewed title  ", "FEAT_001")
+        output = TaskGeneratorOutput(tasks=[task])
+        with patch.object(generator, "list_tasks", return_value=[]), \
+             patch.object(generator, "call_structured", return_value=SimpleNamespace(parsed=output)):
+            result = generator.run_task_generator({}, {"plan": {"requirements_rtm": [
+                {"id": "FEAT_001", "desc": "Login"}]}}, "team-1", "fake", "fake")
+        self.assertEqual(result["task_proposals"], [task])
+
+
 if __name__ == "__main__":
     unittest.main()

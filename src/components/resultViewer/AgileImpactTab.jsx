@@ -84,25 +84,21 @@ export default function AgileImpactTab() {
     }
   };
 
-  const saveToMemo = () => {
+  const saveToMemo = async () => {
     if (!result) return;
     const components = result.impacted_components || [];
     const summary = result.summary || changeDesc;
     // Save overall summary as one memo
-    addComment({
+    const outcomes = await Promise.all([addComment({
       text: `[영향 분석] ${summary}`,
       section: "agile_impact",
       detail: components.map((c) => `• ${c.name} (${IMPACT_TYPE_LABEL[c.impact_type] || c.impact_type}): ${c.description}`).join("\n"),
-    });
-    // Save each impacted component as separate memo
-    components.forEach((comp) => {
-      addComment({
+    }), ...components.map((comp) => addComment({
         text: `${comp.name} — ${IMPACT_TYPE_LABEL[comp.impact_type] || comp.impact_type}`,
         section: "agile_impact",
         detail: comp.description,
-      });
-    });
-    setSavedToMemo(true);
+      }))]);
+    setSavedToMemo(outcomes.every(Boolean));
   };
 
   const riskCfg = result ? (RISK_CONFIG[result.risk_level] || RISK_CONFIG.medium) : null;

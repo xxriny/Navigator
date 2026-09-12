@@ -104,6 +104,7 @@ class AnalysisRequest(BaseModel):
 
 
 class IdeaChatRequest(BaseModel):
+    session_id: str = ""
     message: str
     chat_history: list = []
     previous_result: dict = {}
@@ -133,15 +134,17 @@ class DeleteSessionRequest(BaseModel):
 
 
 class MemoRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     session_id: str
     text: str
-    selected_text: str = ""
+    selected_text: str = Field(default="", max_length=4000)
     section: str = "Global"
     detail: str = ""
 
 
 class MemoApplyRequest(BaseModel):
-    memo_ids: list = []
+    model_config = {"extra": "forbid"}
+    memo_ids: list[str] = Field(default_factory=list, max_length=100)
     reflected_version: Optional[str] = None
 
 
@@ -322,10 +325,24 @@ async def analyze(req: AnalysisRequest, shared_db: Session = Depends(get_shared_
 
 
 @rest_router.post("/api/idea-chat")
-async def idea_chat(req: IdeaChatRequest):
+async def idea_chat(
+    req: IdeaChatRequest, current_user: Optional[User] = Depends(get_current_user_optional),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
     _ensure_pipeline()
     try:
         api_key = req.api_key
+        def review_result(shaped):
+            from pipeline.domain.chat.memo_approval import issue_memo_proposal
+            notes = shaped.get("notes_to_add") or []
+            shaped.update(chat_reply=shaped.get("agent_reply", ""), notes_to_add=[],
+                          memo_proposal=None, memo_proposal_error=None)
+            if notes:
+                try:
+                    shaped["memo_proposal"] = issue_memo_proposal(
+                        db, shared_db, current_user, req.session_id, notes)
+                except Exception as exc:
+                    shaped["memo_proposal_error"] = getattr(exc, "detail", None) or "메모 제안을 준비하지 못했습니다. 다시 시도하세요."
         return _to_response(execute_pipeline(
             get_idea_pipeline(),
             {
@@ -336,7 +353,7 @@ async def idea_chat(req: IdeaChatRequest):
                 "previous_result": req.previous_result,
             },
             "idea_chat",
-            result_mutator=lambda s: s.update({"chat_reply": s.get("agent_reply", "")}),
+            result_mutator=review_result,
         ))
     except Exception as e:
         get_logger().exception("idea_chat endpoint failed")
@@ -398,121 +415,121 @@ async def extract_final_idea_endpoint(req: ExtractFinalIdeaRequest):
 
 
 @rest_router.delete("/api/session/{run_id}")
-async def delete_session(run_id: str, req: Optional[DeleteSessionRequest] = None):
-    if not re.match(r"^\d{8}_\d{6}$", run_id):
-        return {"status": "error", "error": "Invalid run_id format. Expected YYYYMMDD_HHMMSS"}
-    return {"status": "ok", "message": f"Session {run_id} deleted"}
+async def delete_session(
+    run_id: str, req: Optional[DeleteSessionRequest] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from pipeline.domain.chat.project_sessions import delete_private_result
+    delete_private_result(db, shared_db, current_user, run_id)
+    return {"status": "ok", "message": "저장된 개인 분석 결과를 삭제했습니다."}
 
 
 @rest_router.get("/api/session/{run_id}/restore")
-async def restore_session(run_id: str):
-    """로컬 DB(AnalysisResult)에서 이전 분석 결과를 복원."""
-    import json
-    from auth.database import SessionLocal
-    from auth.models import AnalysisResult
-    db = SessionLocal()
-    try:
-        record = db.query(AnalysisResult).filter(AnalysisResult.run_id == run_id).first()
-        if not record:
-            return {"status": "error", "error": f"No saved result for run_id '{run_id}'"}
-        data = json.loads(record.shaped_result)
-        return {"status": "ok", "data": data}
-    except Exception as e:
-        get_logger().exception(f"restore_session failed for {run_id}")
-        return {"status": "error", "error": str(e)}
-    finally:
-        db.close()
+async def restore_session(
+    run_id: str, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from pipeline.domain.chat.project_sessions import restore_private_result
+    return {"status": "ok", "data": restore_private_result(db, shared_db, current_user, run_id)}
 
 
 @rest_router.get("/api/memos")
-async def get_memos_endpoint(session_id: Optional[str] = None):
-    from auth.database import get_db as _get_db
+async def get_memos_endpoint(
+    session_id: Optional[str] = None, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
     from auth.models import MemoItem
+    from pipeline.domain.chat.memo_approval import authorize_session
     if not session_id:
         return {"status": "ok", "memos": []}
-    try:
-        db = next(_get_db())
-        q = db.query(MemoItem).filter(MemoItem.session_id == session_id)
-        items = q.order_by(MemoItem.created_at.asc()).all()
-        memos = [
-            {
-                "id": m.id,
-                "session_id": m.session_id,
-                "text": m.text,
-                "metadata": {
-                    "selected_text": m.selected_text,
-                    "section": m.section,
-                    "detail": m.detail,
-                    "applied": m.applied,
-                    "applied_at": m.applied_at,
-                    "reflected_version": getattr(m, "reflected_version", None),
-                },
-            }
-            for m in items
-        ]
-        return {"status": "ok", "memos": memos}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    authorize_session(db, shared_db, current_user, session_id)
+    items = db.query(MemoItem).filter_by(session_id=session_id).order_by(MemoItem.created_at.asc()).all()
+    return {"status": "ok", "memos": [dict(
+        id=m.id, session_id=m.session_id, text=m.text,
+        metadata=dict(selected_text=m.selected_text, section=m.section, detail=m.detail,
+                      applied=m.applied, applied_at=m.applied_at, reflected_version=m.reflected_version),
+    ) for m in items]}
 
 
 @rest_router.post("/api/memos")
-async def add_memo_endpoint(req: MemoRequest):
-    from auth.database import get_db as _get_db
+async def add_memo_endpoint(
+    req: MemoRequest, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    """Explicit manual save of displayed user input; never called by Chat output."""
     from auth.models import MemoItem
+    from pipeline.domain.chat.memo_approval import authorize_session
+    from pipeline.domain.chat.memo_candidates import validate_memo_content
+    from fastapi import HTTPException
+    session = authorize_session(db, shared_db, current_user, req.session_id)
     try:
-        db = next(_get_db())
-        memo = MemoItem(
-            session_id=req.session_id,
-            text=req.text,
-            selected_text=req.selected_text,
-            section=req.section,
-            detail=req.detail,
-        )
+        content = validate_memo_content(req.text, req.section, req.detail)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    try:
+        existing = db.query(MemoItem).filter_by(session_id=req.session_id, selected_text=req.selected_text, **content).first()
+        if existing:
+            return {"status": "ok", "memo_id": existing.id}
+        memo = MemoItem(session_id=req.session_id, team_id=session.team_id, selected_text=req.selected_text, **content)
         db.add(memo)
+        db.flush()
+        memo_id = memo.id
         db.commit()
-        db.refresh(memo)
-        return {"status": "ok", "memo_id": memo.id}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return {"status": "ok", "memo_id": memo_id}
+    except Exception:
+        db.rollback()
+        raise
 
 
 @rest_router.delete("/api/memos/{memo_id}")
-async def delete_memo_endpoint(memo_id: str):
-    from auth.database import get_db as _get_db
+async def delete_memo_endpoint(
+    memo_id: str, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
     from auth.models import MemoItem
+    from pipeline.domain.chat.memo_approval import authorize_session
+    from fastapi import HTTPException
+    memo = db.get(MemoItem, memo_id)
+    if memo is None:
+        raise HTTPException(404, '메모를 찾을 수 없습니다.')
+    authorize_session(db, shared_db, current_user, memo.session_id)
     try:
-        db = next(_get_db())
-        memo = db.query(MemoItem).filter(MemoItem.id == memo_id).first()
-        if memo:
-            db.delete(memo)
-            db.commit()
-        return {"status": "ok"}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+        db.delete(memo)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"status": "ok"}
 
 
 @rest_router.post("/api/memos/apply")
-async def apply_memos_endpoint(req: MemoApplyRequest):
-    from auth.database import get_db as _get_db
+async def apply_memos_endpoint(
+    req: MemoApplyRequest, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
     from auth.models import MemoItem
-    from datetime import datetime as _dt
+    from pipeline.domain.chat.memo_approval import authorize_session
+    from fastapi import HTTPException
+    ids = set(req.memo_ids)
+    if len(ids) != len(req.memo_ids):
+        raise HTTPException(422, '메모 ID가 중복되었습니다.')
+    rows = db.query(MemoItem).filter(MemoItem.id.in_(ids)).all()
+    if len(rows) != len(ids):
+        raise HTTPException(404, '메모를 찾을 수 없습니다.')
+    for session_id in {m.session_id for m in rows}:
+        authorize_session(db, shared_db, current_user, session_id)
     try:
-        db = next(_get_db())
-        ts = _dt.utcnow().isoformat()
-        updated = (
-            db.query(MemoItem)
-            .filter(MemoItem.id.in_(req.memo_ids))
-            .all()
-        )
-        for m in updated:
-            m.applied = True
-            m.applied_at = ts
+        ts = datetime.utcnow().isoformat()
+        for memo in rows:
+            memo.applied, memo.applied_at = True, ts
             if req.reflected_version:
-                m.reflected_version = req.reflected_version
+                memo.reflected_version = req.reflected_version
         db.commit()
-        return {"status": "ok", "updated": len(updated)}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+    except Exception:
+        db.rollback()
+        raise
+    return {"status": "ok", "updated": len(rows)}
 
 
 # ── Agile Layer ───────────────────────────────────────────
@@ -782,6 +799,13 @@ class TaskCreateRequest(BaseModel):
 
 
 class TaskUpdateRequest(BaseModel):
+    expected_updated_at: Optional[str] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    area: Optional[str] = None
+    effort: Optional[str] = None
+    task_type: Optional[str] = None
+    assignee: Optional[str] = None
     status: str
     reviewed_by: str = ""
     result: str = ""
@@ -1417,25 +1441,12 @@ def _resolve_github_webhook_actor(normalized: dict, shared_db: Session | None) -
 
 
 @rest_router.post("/api/tasks")
-async def create_task_endpoint(req: TaskCreateRequest):
-    """새 태스크 생성 (PM 승인 대기)."""
-    try:
-        from pipeline.domain.agile.task_coordinator import create_task, init_tasks_db
-        init_tasks_db()
-        task = create_task(
-            task_type=req.task_type,
-            title=req.title,
-            description=req.description,
-            area=req.area,
-            assignee=req.assignee,
-            payload=req.payload,
-            created_by=req.created_by,
-            team_id=req.team_id,
-        )
-        return {"status": "ok", "data": task}
-    except Exception as e:
-        get_logger().exception("create_task endpoint failed")
-        return {"status": "error", "error": str(e)}
+async def create_task_endpoint(
+    req: TaskCreateRequest, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from pipeline.domain.agile.manual_tasks import create_manual_task
+    return {"status": "ok", "data": create_manual_task(db, shared_db, current_user, req.model_dump())}
 
 
 @rest_router.post("/api/webhook/github")
@@ -1813,15 +1824,18 @@ async def dev_gap_sa_review_request_endpoint(
 
 
 @rest_router.get("/api/tasks")
-async def list_tasks_endpoint(status: Optional[str] = None, team_id: Optional[str] = None):
-    """태스크 목록 조회."""
-    try:
-        from pipeline.domain.agile.task_coordinator import list_tasks, init_tasks_db
-        init_tasks_db()
-        tasks = list_tasks(status=status, team_id=team_id or None)
-        return {"status": "ok", "data": tasks}
-    except Exception as e:
-        return {"status": "error", "error": str(e)}
+async def list_tasks_endpoint(
+    status: Optional[str] = None, team_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db),
+    shared_db: Session = Depends(get_shared_db),
+):
+    from pipeline.domain.agile.manual_tasks import authorize_team
+    from pipeline.domain.agile.task_coordinator import AgileTask, _task_to_dict
+    team_id = team_id or current_user.team_id
+    authorize_team(shared_db, current_user, team_id)
+    query = db.query(AgileTask).filter_by(team_id=team_id)
+    if status: query = query.filter_by(status=status)
+    return {"status": "ok", "data": [_task_to_dict(t) for t in query.order_by(AgileTask.created_at.desc()).all()]}
 
 
 @rest_router.patch("/api/tasks/{task_id}")
@@ -1829,8 +1843,22 @@ async def update_task_endpoint(
     task_id: str,
     req: TaskUpdateRequest,
     current_user: Optional[User] = Depends(get_current_user_optional),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
 ):
     """태스크 상태 업데이트 (승인/거절/완료)."""
+    from fastapi import HTTPException
+    from pipeline.domain.agile.task_coordinator import AgileTask
+    from pipeline.domain.agile.manual_tasks import authorize_team, mutate_manual_task
+    if current_user is None:
+        raise HTTPException(401, '로그인이 필요합니다.')
+    existing_row = db.get(AgileTask, task_id)
+    if existing_row is None:
+        raise HTTPException(404, '태스크를 찾을 수 없습니다.')
+    authorize_team(shared_db, current_user, existing_row.team_id)
+    if existing_row.task_type != 'dev_gap_approval':
+        return {"status": "ok", "data": mutate_manual_task(
+            db, shared_db, current_user, task_id, req.model_dump(exclude_unset=True))}
+
     allowed_statuses = {"unassigned", "pending_approval", "in_progress", "pr_pending", "completed", "rejected"}
     if req.status not in allowed_statuses:
         return {"status": "error", "error": f"Invalid status. Allowed: {allowed_statuses}"}
@@ -1877,21 +1905,17 @@ async def update_task_endpoint(
 
 
 @rest_router.delete("/api/tasks/{task_id}")
-async def delete_task_endpoint(task_id: str):
-    """완료/거절된 태스크 삭제."""
-    try:
-        from pipeline.domain.agile.task_coordinator import delete_task, init_tasks_db
-        init_tasks_db()
-        deleted = delete_task(task_id)
-        if not deleted:
-            return {"status": "error", "error": "Task not found"}
-        return {"status": "ok"}
-    except Exception as e:
-        get_logger().exception(f"delete_task endpoint failed for {task_id}")
-        return {"status": "error", "error": str(e)}
+async def delete_task_endpoint(
+    task_id: str, expected_updated_at: Optional[str] = None, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from pipeline.domain.agile.manual_tasks import mutate_manual_task
+    return {"status": "ok", "data": mutate_manual_task(db, shared_db, current_user, task_id, values={'expected_updated_at': expected_updated_at}, delete=True)}
 
 
 class GenerateTasksRequest(BaseModel):
+    security_scope: dict[str, list[str]] = Field(default_factory=dict)
+    scope_reviewed: bool = False
     run_id: str
     team_id: str
     auth_token: str = ""
@@ -1901,70 +1925,68 @@ class GenerateTasksRequest(BaseModel):
 
 
 class DistributeTasksRequest(BaseModel):
+    model_config = {"extra": "forbid"}
     team_id: str
     auth_token: str = ""
     api_key: str = ""
     model: str = ""
     distributed_by: str = ""
-    members: list = []
+    members: list = Field(default_factory=list)
 
 
 @rest_router.post("/api/agile/generate-tasks")
-async def generate_tasks_endpoint(req: GenerateTasksRequest):
-    """SA/PM 산출물 → unassigned 태스크 자동 생성 (파이프라인 완료 후 호출)."""
-    active_jwt_token.set(req.auth_token)
+async def generate_tasks_endpoint(
+    req: GenerateTasksRequest, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    """Return server-bound review proposals; generation never saves tasks."""
+    from fastapi import HTTPException
+    from auth.models import AnalysisResult
+    from pipeline.domain.chat.memo_approval import authorize_session
+    from pipeline.domain.agile.task_approval import issue_task_proposal, analysis_digest
+    from pipeline.domain.agile.nodes.task_generator import run_task_generator
+    authorize_session(db, shared_db, current_user, req.run_id, team_id=req.team_id, pm=True)
+    record = db.get(AnalysisResult, req.run_id)
+    if record is None:
+        raise HTTPException(404, '분석 결과가 없습니다.')
+    digest = analysis_digest(record.shaped_result)
+    shaped = json.loads(record.shaped_result)
+    pm_bundle = shaped.get('pm_bundle') or {}
+    # Match the stored PM/flattened result contract without modifying PM output.
+    rtm = ((pm_bundle.get('plan') or {}).get('requirements_rtm') or
+           shaped.get('requirements_rtm') or (pm_bundle.get('data') or {}).get('rtm') or [])
+    pm_bundle = {**pm_bundle, 'plan': {**(pm_bundle.get('plan') or {}), 'requirements_rtm': rtm}}
+    refs = {r['id'] for r in rtm if isinstance(r, dict) and isinstance(r.get('id'), str)}
+    from pipeline.domain.agile.security_rules import validate_scope
     try:
-        from auth.database import SessionLocal
-        from auth.models import AnalysisResult
-        from pipeline.domain.agile.nodes.task_generator import run_task_generator
-        from version import DEFAULT_MODEL
-        import json
-
-        db = SessionLocal()
-        try:
-            record = db.query(AnalysisResult).filter(AnalysisResult.run_id == req.run_id).first()
-            if not record:
-                return {"status": "error", "error": f"run_id '{req.run_id}' 결과 없음"}
-            shaped = json.loads(record.shaped_result)
-        finally:
-            db.close()
-
-        sa_bundle = shaped.get("sa_arch_bundle") or {}
-        pm_bundle = shaped.get("pm_bundle") or {}
-
-        result = run_task_generator(
-            sa_bundle=sa_bundle,
-            pm_bundle=pm_bundle,
-            team_id=req.team_id,
-            api_key=req.api_key,
-            model=req.model or DEFAULT_MODEL,
-            created_by=req.created_by,
-        )
-        return {"status": "ok", "data": result}
-    except Exception as e:
-        get_logger().exception("generate_tasks endpoint failed")
-        return {"status": "error", "error": str(e)}
+        validate_scope(req.security_scope, refs, req.scope_reviewed)
+        result = run_task_generator(shaped.get('sa_arch_bundle') or {}, pm_bundle, req.team_id,
+                                    req.api_key, req.model or DEFAULT_MODEL, current_user.id)
+        result['review_proposal'] = issue_task_proposal(
+            db, shared_db, current_user, req.run_id, req.team_id, result, digest, refs, req.security_scope, req.scope_reviewed)
+        return {'status': 'ok', 'data': result}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @rest_router.post("/api/agile/distribute-tasks")
-async def distribute_tasks_endpoint(req: DistributeTasksRequest):
-    """unassigned 태스크를 팀 멤버에게 배분 (PM이 '배분' 버튼 클릭 시 호출)."""
-    active_jwt_token.set(req.auth_token)
+async def distribute_tasks_endpoint(
+    req: DistributeTasksRequest, request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    """Generate a reviewed team assignment proposal; never assign immediately."""
+    from fastapi import HTTPException
+    from pipeline.domain.agile.assignment_approval import generate_assignment_proposal
+    header = request.headers.get('authorization', '').split()
+    context_token = active_jwt_token.set(header[1] if len(header) == 2 else '')
     try:
-        from pipeline.domain.agile.nodes.task_distributor import run_task_distributor
-        from version import DEFAULT_MODEL
-
-        result = run_task_distributor(
-            team_id=req.team_id,
-            api_key=req.api_key,
-            model=req.model or DEFAULT_MODEL,
-            distributed_by=req.distributed_by,
-            members=req.members or [],
-        )
-        return {"status": "ok", "data": result}
-    except Exception as e:
-        get_logger().exception("distribute_tasks endpoint failed")
-        return {"status": "error", "error": str(e)}
+        result = generate_assignment_proposal(db, shared_db, current_user, req.team_id, req.api_key, req.model or DEFAULT_MODEL)
+        return {'status': 'ok', 'data': result}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    finally:
+        active_jwt_token.reset(context_token)
 
 
 @rest_router.post("/api/doc-sync")
@@ -2162,3 +2184,125 @@ async def github_issues_import(req: GitHubIssuesImportRequest):
     except Exception as e:
         get_logger().exception("github_issues_import endpoint failed")
         return {"status": "error", "error": str(e)}
+
+
+class MemoProposalAction(BaseModel):
+    model_config = {"extra": "forbid"}
+    selected_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
+@rest_router.post("/api/memo-proposals/{proposal_id}/approve")
+async def approve_memo_proposal_endpoint(
+    proposal_id: str, req: MemoProposalAction,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from fastapi import HTTPException
+    from pipeline.domain.chat.memo_approval import process_memo_proposal
+    from pipeline.domain.agile.approval_store import ProposalError
+    try:
+        return {"status": "ok", "data": process_memo_proposal(
+            db, shared_db, current_user, proposal_id, req.selected_ids)}
+    except ProposalError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@rest_router.post("/api/memo-proposals/{proposal_id}/cancel")
+async def cancel_memo_proposal_endpoint(
+    proposal_id: str, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from fastapi import HTTPException
+    from pipeline.domain.chat.memo_approval import process_memo_proposal
+    from pipeline.domain.agile.approval_store import ProposalError
+    try:
+        return {"status": "ok", "data": process_memo_proposal(
+            db, shared_db, current_user, proposal_id, cancel=True)}
+    except ProposalError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@rest_router.post("/api/task-proposals/{proposal_id}/approve")
+async def approve_task_proposal_endpoint(
+    proposal_id: str, req: MemoProposalAction,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from fastapi import HTTPException
+    from pipeline.domain.agile.task_approval import process_task_proposal
+    from pipeline.domain.agile.approval_store import ProposalError
+    try:
+        return {"status": "ok", "data": process_task_proposal(
+            db, shared_db, current_user, proposal_id, req.selected_ids)}
+    except ProposalError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@rest_router.post("/api/task-proposals/{proposal_id}/cancel")
+async def cancel_task_proposal_endpoint(
+    proposal_id: str, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from fastapi import HTTPException
+    from pipeline.domain.agile.task_approval import process_task_proposal
+    from pipeline.domain.agile.approval_store import ProposalError
+    try:
+        return {"status": "ok", "data": process_task_proposal(
+            db, shared_db, current_user, proposal_id, cancel=True)}
+    except ProposalError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+class ProjectRegistrationRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    client_request_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    title: str = Field(default="새 프로젝트", max_length=500)
+    team_id: Optional[str] = Field(default=None, max_length=36)
+
+
+@rest_router.post("/api/projects")
+async def create_project_endpoint(
+    req: ProjectRegistrationRequest, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from pipeline.domain.chat.project_sessions import create_project
+    return {"status": "ok", "data": create_project(db, shared_db, current_user, req.title, req.team_id, req.client_request_id)}
+
+
+@rest_router.get("/api/projects/{project_id}")
+async def get_project_endpoint(
+    project_id: str, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from pipeline.domain.chat.memo_approval import authorize_session
+    project = authorize_session(db, shared_db, current_user, project_id)
+    return {"status": "ok", "data": {"session_id": project.run_id, "team_id": project.team_id,
+                                       "created_by": project.created_by}}
+
+
+@rest_router.post('/api/assignment-proposals/{proposal_id}/approve')
+async def approve_assignment_proposal_endpoint(
+    proposal_id: str, req: MemoProposalAction, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from fastapi import HTTPException
+    from pipeline.domain.agile.assignment_approval import process_assignment_proposal
+    from pipeline.domain.agile.approval_store import ProposalError
+    try:
+        return {'status': 'ok', 'data': process_assignment_proposal(db, shared_db, current_user, proposal_id, req.selected_ids)}
+    except ProposalError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@rest_router.post('/api/assignment-proposals/{proposal_id}/cancel')
+async def cancel_assignment_proposal_endpoint(
+    proposal_id: str, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db), shared_db: Session = Depends(get_shared_db),
+):
+    from fastapi import HTTPException
+    from pipeline.domain.agile.assignment_approval import process_assignment_proposal
+    from pipeline.domain.agile.approval_store import ProposalError
+    try:
+        return {'status': 'ok', 'data': process_assignment_proposal(db, shared_db, current_user, proposal_id, cancel=True)}
+    except ProposalError as exc:
+        raise HTTPException(409, str(exc)) from exc

@@ -15,6 +15,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from jose import JWTError, jwt
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from database import get_db
 from models import Team, User, Subscription, TeamInvite, TeamMember
@@ -703,124 +704,106 @@ async def switch_team(
 
 _DEVICE_SCOPE = "repo user:email read:user read:org workflow"
 
-_oauth_sessions: dict = {}
+def _github_json(method, url, **kwargs):
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=False) as client:
+            response = client.request(method, url, **kwargs)
+        if response.status_code != 200:
+            raise HTTPException(502, "GitHub 인증 서버의 응답을 확인할 수 없습니다.")
+        value = response.json()
+        if not isinstance(value, dict):
+            raise ValueError("Invalid provider response")
+        return value
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(502, "GitHub 인증 서버에 연결할 수 없습니다.") from None
+
+
+def _device_client_id():
+    value = os.environ.get("GITHUB_CLIENT_ID", "").strip()
+    if not value:
+        raise HTTPException(503, "서버에 GitHub Client ID가 설정되지 않았습니다. 서버 관리자에게 문의해주세요.")
+    return value
 
 
 @router.post("/github/device/start")
-async def github_device_start(db: Session = Depends(get_db)):
-    client_id = os.environ.get("GITHUB_CLIENT_ID", "")
-    if not client_id:
-        raise HTTPException(status_code=503, detail="GitHub Client ID가 설정되지 않았습니다.")
-    payload = {"client_id": client_id, "scope": _DEVICE_SCOPE}
-    headers = {"Accept": "application/json", "User-Agent": "Navigator-Server/1.0"}
-    with httpx.Client() as c:
-        resp = c.post(
-            "https://github.com/login/device/code",
-            content=urllib.parse.urlencode(payload),
-            headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
-        )
-    return resp.json()
+def github_device_start():
+    data = _github_json("POST", "https://github.com/login/device/code",
+        json={"client_id": _device_client_id(), "scope": _DEVICE_SCOPE},
+        headers={"Accept": "application/json", "User-Agent": "Navigator-Server/1.0"})
+    if (not isinstance(data.get("device_code"), str) or not data["device_code"] or
+            not isinstance(data.get("user_code"), str) or not data["user_code"] or
+            data.get("verification_uri") != "https://github.com/login/device" or
+            type(data.get("interval")) is not int or data["interval"] <= 0 or
+            type(data.get("expires_in")) is not int or data["expires_in"] <= 0):
+        raise HTTPException(502, "GitHub Device Flow 설정 또는 응답을 확인해주세요.")
+    return {key: data[key] for key in ("device_code", "user_code", "verification_uri", "interval", "expires_in")}
 
 
 @router.post("/github/device/poll")
-async def github_device_poll(
+def github_device_poll(
     req: DevicePollRequest,
     authorization: Optional[str] = Header(default=None),
     db: Session = Depends(get_db),
 ):
-    client_id = os.environ.get("GITHUB_CLIENT_ID", "")
-    payload = {
-        "client_id": client_id,
-        "device_code": req.device_code,
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-    }
-    with httpx.Client() as c:
-        resp = c.post(
-            "https://github.com/login/oauth/access_token",
-            json=payload,
-            headers={"Accept": "application/json", "User-Agent": "Navigator-Server/1.0"},
-        )
-    data = resp.json()
-    if "access_token" not in data:
-        return data  # authorization_pending 등
+    # A link request must never fall back to anonymous login on invalid auth.
+    logged_in_user = None
+    if authorization is not None:
+        token = _token_from_header(authorization)
+        claims = decode_token(token) if token else None
+        logged_in_user = db.get(User, claims.get("sub")) if claims and claims.get("sub") else None
+        if logged_in_user is None:
+            raise HTTPException(401, "로그인 인증이 만료되었거나 유효하지 않습니다.")
+    if not req.device_code or len(req.device_code) > 1024:
+        raise HTTPException(422, "유효한 인증 코드가 필요합니다.")
+    data = _github_json("POST", "https://github.com/login/oauth/access_token",
+        json={"client_id": _device_client_id(), "device_code": req.device_code,
+              "grant_type": "urn:ietf:params:oauth:grant-type:device_code"},
+        headers={"Accept": "application/json", "User-Agent": "Navigator-Server/1.0"})
+    gh_token = data.get("access_token")
+    if not isinstance(gh_token, str) or not gh_token:
+        allowed = {"authorization_pending", "slow_down", "expired_token", "access_denied",
+                   "incorrect_client_credentials", "incorrect_device_code", "device_flow_disabled",
+                   "unsupported_grant_type"}
+        error = data.get("error")
+        if error not in allowed:
+            raise HTTPException(502, "GitHub 인증 응답을 검증하지 못했습니다.")
+        result = {"error": error}
+        if type(data.get("interval")) is int and data["interval"] > 0:
+            result["interval"] = data["interval"]
+        return result
 
-    # GitHub 유저 정보 조회
-    gh_token = data["access_token"]
-    with httpx.Client() as c:
-        gh = c.get(
-            "https://api.github.com/user",
-            headers={
-                "Authorization": f"Bearer {gh_token}",
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "Navigator-Server/1.0",
-            },
-        ).json()
-
-    github_id = str(gh.get("id", ""))
-    email = gh.get("email") or f"{gh.get('login', 'unknown')}@github.local"
-    name  = gh.get("name") or gh.get("login", "GitHub User")
-    login = gh.get("login", "")
-
-    # 이미 로그인된 사용자가 GitHub를 연동하는 경우: 기존 계정에 GitHub를 연결
-    logged_in_user: Optional[User] = None
-    if authorization:
-        parts = authorization.split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            token_payload = decode_token(parts[1])
-            if token_payload:
-                logged_in_user = db.query(User).filter(User.id == token_payload["sub"]).first()
-
+    gh = _github_json("GET", "https://api.github.com/user", headers={
+        "Authorization": f"Bearer {gh_token}", "Accept": "application/vnd.github+json",
+        "User-Agent": "Navigator-Server/1.0"})
+    if (type(gh.get("id")) is not int or gh["id"] <= 0 or
+            not isinstance(gh.get("login"), str) or not gh["login"]):
+        raise HTTPException(502, "GitHub 사용자 정보를 검증하지 못했습니다.")
+    github_id, login = str(gh["id"]), gh["login"]
+    existing = db.query(User).filter(User.github_id == github_id).first()
     if logged_in_user:
-        # 다른 유저가 이미 같은 github_id를 갖고 있으면 먼저 해제 (UNIQUE 충돌 방지)
-        existing = db.query(User).filter(
-            User.github_id == github_id,
-            User.id != logged_in_user.id,
-        ).first()
-        if existing:
-            existing.github_id = None
-            existing.github_login = None
-            existing.github_oauth_token = None
-
-        # 기존 로그인 사용자에 GitHub 정보 연결 (계정 전환 없음)
-        logged_in_user.github_id          = github_id
-        logged_in_user.github_login       = login
-        logged_in_user.github_username    = login
-        logged_in_user.github_oauth_token = gh_token
-        db.commit()
-        db.refresh(logged_in_user)
-        jwt_token = _make_token(logged_in_user.id, logged_in_user.email, logged_in_user.role)
-        return {
-            "access_token": jwt_token,
-            "token_type": "bearer",
-            "user": _build_user_response(db, logged_in_user).model_dump(),
-        }
-
-    # 비로그인 상태 — github_id 또는 email로 기존 계정 탐색
-    user = db.query(User).filter(User.github_id == github_id).first()
-    if not user:
-        user = db.query(User).filter(User.email == email).first()
-
-    if not user:
-        user = User(
-            name=name, email=email, password_hash="",
-            role="engineer",
-            github_id=github_id,
-            github_login=login,
-            github_username=login,
-            github_oauth_token=gh_token,
-        )
-        db.add(user)
+        if existing and existing.id != logged_in_user.id:
+            raise HTTPException(409, "이 GitHub 계정은 다른 NAVIGATOR 계정에 연결되어 있습니다.")
+        user = logged_in_user
+    elif existing:
+        user = existing
     else:
-        user.github_id           = github_id
-        user.github_login        = login
-        user.github_oauth_token  = gh_token
-        user.github_username     = login
-
-    db.commit()
+        email = gh.get("email") or f"{login}@github.local"
+        if not isinstance(email, str):
+            raise HTTPException(502, "GitHub 사용자 정보를 검증하지 못했습니다.")
+        if db.query(User).filter(User.email == email).first():
+            raise HTTPException(409, "같은 이메일의 계정이 있습니다. 기존 계정으로 로그인한 뒤 GitHub를 연결해주세요.")
+        user = User(name=gh.get("name") or login, email=email,
+                    password_hash="", role="software_engineer")
+        db.add(user)
+    user.github_id = github_id
+    user.github_login = login
+    user.github_username = login
+    user.github_oauth_token = gh_token
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "계정 연결이 변경되었습니다. 로그인 상태를 확인하고 다시 시도해주세요.") from None
     db.refresh(user)
-    jwt_token = _make_token(user.id, user.email, user.role)
-    return {
-        "access_token": jwt_token,
-        "token_type": "bearer",
-        "user": _build_user_response(db, user).model_dump(),
-    }
+    return {"status": "ok", "access_token": _make_token(user.id, user.email, user.role),
+            "token_type": "bearer", "user": _build_user_response(db, user).model_dump()}

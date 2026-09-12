@@ -7,6 +7,7 @@ import {
   FolderGit2, Search, ArrowUp, BookOpen, CircleDot, ChevronDown,
 } from "lucide-react";
 import ChatThread from "./chat/ChatThread";
+import AnchoredPopover from "./ui/AnchoredPopover";
 import SyncConfirmModal from "./SyncConfirmModal";
 import { serverRequest } from "../api/serverClient";
 
@@ -201,14 +202,7 @@ export default function HomeScreen() {
   };
 
   // Close plus menu on outside click
-  useEffect(() => {
-    if (!plusMenuOpen) return;
-    const handler = (e) => {
-      if (plusMenuRef.current && !plusMenuRef.current.contains(e.target)) setPlusMenuOpen(false);
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, [plusMenuOpen]);
+
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -354,7 +348,7 @@ export default function HomeScreen() {
                     </button>
 
                     {plusMenuOpen && (
-                      <PlusMenu
+                      <PlusMenu anchorRef={plusMenuRef}
                         isDarkMode={isDarkMode}
                         onAttach={handleAttach}
                         onClose={() => setPlusMenuOpen(false)}
@@ -460,7 +454,7 @@ export default function HomeScreen() {
                       <Plus size={16} strokeWidth={2.2} />
                     </button>
                     {plusMenuOpen && (
-                      <PlusMenu
+                      <PlusMenu anchorRef={plusMenuRef}
                         isDarkMode={isDarkMode}
                         onAttach={handleAttach}
                         onClose={() => setPlusMenuOpen(false)}
@@ -514,7 +508,7 @@ export default function HomeScreen() {
 }
 
 /* ── + 메뉴 (GitHub 레포 피커 + 문서 업로드) ── */
-function PlusMenu({ isDarkMode, onAttach, onClose }) {
+function PlusMenu({ isDarkMode, onAttach, onClose, anchorRef }) {
   const [view, setView] = useState("main"); // "main" | "repo"
   const backendPort = useAppStore.getState().backendPort;
 
@@ -542,7 +536,7 @@ function PlusMenu({ isDarkMode, onAttach, onClose }) {
   };
 
   return (
-    <div className={`absolute top-[40px] left-0 w-[240px] rounded-2xl border shadow-[0_8px_32px_rgba(0,0,0,0.4)] z-50 animate-fade-in overflow-hidden ${
+    <AnchoredPopover anchorRef={anchorRef} onClose={onClose} label="컨텍스트 첨부" className={`rounded-2xl border shadow-[0_8px_32px_rgba(0,0,0,0.4)] ${
       isDarkMode ? "bg-[#0e1218] border-white/[0.08]" : "bg-white border-slate-200/80"
     }`}>
       {view === "main" ? (
@@ -588,7 +582,7 @@ function PlusMenu({ isDarkMode, onAttach, onClose }) {
       ) : (
         <RepoPicker isDarkMode={isDarkMode} onAttach={onAttach} onBack={() => setView("main")} />
       )}
-    </div>
+    </AnchoredPopover>
   );
 }
 

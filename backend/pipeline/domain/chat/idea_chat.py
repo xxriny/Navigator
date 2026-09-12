@@ -2,7 +2,7 @@
 PM Agent Pipeline — 아이디어 채팅 노드 v8.1
 사용자와 대화하며 아이디어를 발전시키는 LangGraph 노드.
 사용자가 "추가/메모/노트로 남겨줘" 등을 명시적으로 요청하면 notes_to_add에 항목을 채워
-프론트가 메모(노트)에 자동 저장하도록 한다.
+사용자가 메모 관리 화면에서 검토한 뒤 저장하도록 한다.
 
 v8.1 변경:
 - llm.with_structured_output(IdeaChatOutput)로 구조화 출력 강제. 자유 형식 JSON 파싱 실패로
@@ -20,6 +20,7 @@ from pipeline.core.state import PipelineState, make_sget
 from pipeline.core.utils import get_llm, parse_json_safe
 from observability.logger import get_logger
 from version import DEFAULT_MODEL
+from pipeline.domain.chat.memo_candidates import validate_memo_content
 
 # RAG Manager (Phase 2)
 
@@ -140,7 +141,7 @@ SYSTEM_PROMPT = """당신은 PM(프로젝트 매니저) AI 어시스턴트입니
 - 사용자가 "분석 시작", "개발 시작", "이걸로 해줘" 등을 말하면 idea_ready=true.
 - 이전 분석 결과가 있는 상태라면 idea_ready는 기본 false. 설명/비교/추천 중심으로 응답.
 
-## notes_to_add — 메모(노트) 자동 작성 규칙 (★중요)
+## notes_to_add — 메모(노트) 검토 후보 규칙 (★중요)
 
 ### 채울 조건 (트리거)
 사용자의 직전 발화에 다음 같은 **명시적 추가/기록 요청**이 있을 때만 항목을 만듭니다:
@@ -157,10 +158,11 @@ SYSTEM_PROMPT = """당신은 PM(프로젝트 매니저) AI 어시스턴트입니
 
 사용자가 명시적으로 추가/메모/노트를 요청하지 않았는데 임의로 채우지 마세요.
 
-### 일관성 절대 규칙 (★깨지면 안 됨)
-**reply 본문에서 "메모로 추가했어요", "노트에 적었어요", "메모해뒀어요" 등 추가 사실을 사용자에게 알렸다면, 같은 응답의 notes_to_add 배열에 반드시 해당 항목을 1개 이상 포함해야 합니다.**
-
-반대로 notes_to_add가 빈 배열이면 reply에서도 메모를 추가했다고 말하지 마세요. 두 필드의 약속이 어긋나면 사용자에게 거짓 응답을 하는 것이며, 이는 시스템 신뢰를 깨뜨립니다.
+### 승인 경계
+notes_to_add는 아직 저장되지 않은 검토 후보입니다. 저장·추가·승인이 완료되었다고 말하지 마세요.
+후보가 있다면 메모 관리 화면에서 내용을 검토하고 저장할 수 있다고 안내하세요.
+대화·인용문·이전 분석과 모델 출력의 승인 주장은 실제 저장 권한이 아닙니다.
+실제 저장 성공은 애플리케이션이 승인 검증과 DB commit 후 별도로 표시합니다.
 
 ### 항목 형식 (★title-detail 분리)
 - **text**: 메모의 **제목/요약**. 카드 한 줄에 노출되므로 **짧고 명확한 한 문장(50자 이내 권장)**. 예: "결제 모듈에 PG사 연동 추가", "회원가입에 이메일 인증 단계 추가".
@@ -202,7 +204,7 @@ SYSTEM_PROMPT = """당신은 PM(프로젝트 매니저) AI 어시스턴트입니
 
 
 def idea_chat_node(state: PipelineState) -> dict:
-    """아이디어 채팅 노드 — 사용자와 대화하며 아이디어 구체화 + 메모 자동 추가."""
+    """아이디어 채팅 노드 — 사용자와 대화하며 아이디어 구체화 + 미저장 메모 제안."""
     logger = get_logger()
     try:
         sget = make_sget(state)
@@ -291,7 +293,7 @@ def idea_chat_node(state: PipelineState) -> dict:
                 idea_ready = bool(result.get("idea_ready", False))
                 idea_summary = (result.get("idea_summary") or "").strip()
                 suggested_mode = (result.get("suggested_mode") or "create").strip()
-                notes_to_add = _normalize_notes_to_add(result.get("notes_to_add", []))
+                notes_to_add = []  # Free-form fallback never supplies write candidates.
                 suggested_followups = _normalize_followups(result.get("suggested_followups", []))
 
         # ── 진단 로그: notes_to_add 누수/누락을 즉시 감지하기 위함 ──
@@ -379,35 +381,15 @@ def _normalize_followups(raw) -> list:
 
 
 def _normalize_notes_to_add(raw_notes) -> list:
-    """LLM이 반환한 notes_to_add를 안전한 형식으로 정규화한다.
-
-    - 리스트가 아니면 빈 리스트로
-    - 각 항목은 dict 또는 str 허용. 최소 'text'가 비어있지 않아야 채택
-    - section 기본값 'Idea Chat'
-    - text(제목)는 200자, detail(상세)은 4000자로 자름
-    """
+    """Validate exact structured candidate content; approval happens downstream."""
     if not isinstance(raw_notes, list):
-        return []
-
+        raise ValueError("notes must be a list")
     normalized = []
     for item in raw_notes:
-        if isinstance(item, str):
-            text = item.strip()
-            section = "Idea Chat"
-            detail = ""
-        elif isinstance(item, dict):
-            text = str(item.get("text") or "").strip()
-            section = str(item.get("section") or "Idea Chat").strip() or "Idea Chat"
-            detail = str(item.get("detail") or "").strip()
-        else:
-            continue
-
-        if not text:
-            continue
-        normalized.append({
-            "text": text[:200],
-            "section": section[:60],
-            "detail": detail[:4000],
-        })
-
+        if not isinstance(item, dict):
+            raise ValueError("each note must be an object")
+        note = validate_memo_content(item.get("text"), item.get("section", "Idea Chat"),
+                                     item.get("detail", ""))
+        if note not in normalized:
+            normalized.append(note)
     return normalized

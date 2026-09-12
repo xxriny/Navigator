@@ -10,7 +10,8 @@ import { createNotificationSlice } from "./slices/notificationSlice";
 import { createAuthSlice } from "./slices/authSlice";
 import { createGithubSlice } from "./slices/githubSlice";
 import { createPublishSlice } from './slices/publishSlice';
-import { apiBaseUrl } from '../api/apiClient';
+import { sessionService } from '../api/services/sessionService';
+import { ownsLocalSession, persistSessions } from './storeHelpers';
 
 /**
  * NAVIGATOR — Global Store (Zustand)
@@ -38,23 +39,24 @@ const useAppStore = create((set, get) => {
     ...createPublishSlice(setWithSave, get),
 
     deleteSession: async (id) => {
-      const { backendPort, sessions, currentSessionId } = get();
-      const session = sessions.find((s) => s.id === id);
-      const runId = session?.resultData?.run_id;
-
-      if (backendPort && runId) {
+      const context = get();
+      const session = context.sessions.find(s => s.id === id);
+      if (!ownsLocalSession(session, context.currentUser)) return;
+      const runId = session.resultData?.run_id;
+      if (runId) {
         try {
-          await fetch(`${apiBaseUrl(backendPort)}/api/session/${runId}`, { method: "DELETE" });
-        } catch (e) { console.error("[DeleteSession] API Failed:", e); }
+          const result = await sessionService.deleteSession(context.backendPort, runId, context.authToken);
+          if (result.status !== "ok") throw new Error(result.error || "삭제하지 못했습니다.");
+        } catch (error) {
+          if (get().authGeneration === context.authGeneration) get().addNotification(`삭제 실패: ${error.message}`, "error");
+          return;
+        }
       }
-
-      setWithSave((state) => {
-        const nextSessions = state.sessions.filter((s) => s.id !== id);
-        return {
-          sessions: nextSessions,
-          currentSessionId: currentSessionId === id ? null : currentSessionId
-        };
-      });
+      if (get().authGeneration !== context.authGeneration) return;
+      if (get().currentSessionId === id) get().startNewProject?.();
+      const nextSessions = get().sessions.filter(s => s.id !== id);
+      persistSessions(nextSessions, context.currentUser);
+      setWithSave({sessions: nextSessions, ...(get().currentSessionId === id ? {currentSessionId: null, serverSessionId: null, chatHistory: [], resultData: null} : {})});
     },
   };
 });

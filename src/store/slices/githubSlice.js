@@ -1,43 +1,30 @@
-const STORAGE_KEY = "navigator_github";
-
-function load() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
+// Repository preferences are per account/team. Credentials remain in memory.
+const key = user => user?.id ? `navigator_github:v2:${encodeURIComponent(user.id)}:${encodeURIComponent(user.team_id || "")}` : null;
+function load(user) {
+  try { return JSON.parse(localStorage.getItem(key(user)) || "{}"); } catch { return {}; }
 }
-
-function save(data) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  } catch {}
+function save(data, user) {
+  if (!key(user)) return;
+  const {owner, repo, branch} = data;
+  try { localStorage.setItem(key(user), JSON.stringify({owner, repo, branch})); } catch {}
 }
-
-const stored = load();
-
 export const createGithubSlice = (set, get) => ({
-  githubToken: stored.token || "",
-  githubOwner: stored.owner || "",
-  githubRepo: stored.repo || "",
-  githubBranch: stored.branch || "main",
-
+  githubToken: "", githubOwner: "", githubRepo: "", githubBranch: "main",
+  loadGithubSettings: user => {
+    const saved = load(user);
+    set({githubToken: "", githubOwner: saved.owner || "", githubRepo: saved.repo || "", githubBranch: saved.branch || "main"});
+  },
   setGithubSettings: (token, owner, repo, branch) => {
-    const currentBranch = get().githubBranch;
-    const br = branch || currentBranch || "main";
-    save({ token, owner, repo, branch: br });
-    set({ githubToken: token, githubOwner: owner, githubRepo: repo, githubBranch: br });
+    const br = branch || get().githubBranch || "main";
+    save({owner, repo, branch: br}, get().currentUser);
+    set({githubToken: token, githubOwner: owner, githubRepo: repo, githubBranch: br});
   },
-
-  setGithubBranch: (branch) => {
-    const current = load();
-    save({ ...current, branch });
-    set({ githubBranch: branch });
+  setGithubBranch: branch => {
+    save({...load(get().currentUser), branch}, get().currentUser);
+    set({githubBranch: branch});
   },
-
   clearGithubSettings: () => {
-    save({});
-    set({ githubToken: "", githubOwner: "", githubRepo: "", githubBranch: "main" });
+    save({}, get().currentUser);
+    set({githubToken: "", githubOwner: "", githubRepo: "", githubBranch: "main"});
   },
 });

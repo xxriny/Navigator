@@ -26,6 +26,16 @@ def get_current_user_optional(
 ) -> Optional[User]:
     if not token:
         return None
+    from auth.remote_identity import auth_mode, resolve_user
+    if auth_mode() == 'remote':
+        try:
+            user = resolve_user(token)
+        except HTTPException as exc:
+            if exc.status_code == 401:
+                return None
+            raise
+        db.info['remote_actor'] = user
+        return user
     payload = decode_token(token)
     if not payload:
         return None

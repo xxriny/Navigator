@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef } from "react";
 import useAppStore from "../../store/useAppStore";
 import { platform } from "../../platform/index.js";
 import { serverRequest } from "../../api/serverClient";
-import { apiBaseUrl } from "../../api/apiClient";
 import {
   LogIn, UserPlus, Eye, EyeOff, Loader2, Github,
   AlertCircle, Settings, ExternalLink, ChevronUp, ChevronDown, CheckCircle2,
@@ -49,87 +48,67 @@ export default function LoginScreen({ isFirstRun = false }) {
   const [ghError, setGhError]         = useState("");
 
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [setupConfig, setSetupConfig]   = useState({ client_id: "", client_secret: "" });
-  const [setupLoading, setSetupLoading] = useState(false);
 
   const pollRef = useRef(null);
+  const deviceAttemptRef = useRef(0);
   const [form, setForm] = useState({
     name: "", email: "", password: "", role: "software_engineer",
     github_username: "", team_name: "",
   });
   const setField = (k) => (e) => setForm((p) => ({ ...p, [k]: e.target.value }));
 
-  useEffect(() => () => clearTimeout(pollRef.current), []);
-
-  const switchMode = (m) => {
-    setMode(m); setError(""); setGhError(""); setShowOptional(false);
-  };
-
-  const startDeviceFlow = async () => {
-    setDeviceState(DEVICE_STARTING); setGhError("");
-    try {
-      const data = await startGithubDeviceFlow();
-      setUserCode(data.user_code || "");
-      setVerificationUri(data.verification_uri || "https://github.com/login/device");
-      const interval = Math.max(data.interval || 5, 5);
-      setDeviceState(DEVICE_WAITING);
-      const uri = data.verification_uri || "https://github.com/login/device";
-      platform.openExternal(uri);
-
-      const schedulePoll = (sec, dc) => {
-        pollRef.current = setTimeout(async () => {
-          if (!pollRef.current && pollRef.current !== 0) return;
-          try {
-            const r = await pollGithubDeviceFlow(dc);
-            if (r.status === "ok") {
-              pollRef.current = null;
-              setDeviceSuccess(true);
-              // setAuth()가 이미 Zustand store를 업데이트했으므로
-              // App.jsx가 자동으로 다음 화면으로 전환됨 (reload 불필요)
-              await checkAuthStatus();
-            } else if (r.status === "error") {
-              pollRef.current = null; setDeviceState(DEVICE_IDLE);
-              setGhError(r.error || "GitHub 인증 실패");
-            } else {
-              schedulePoll(r.interval ? Math.max(r.interval, sec) : sec, dc);
-            }
-          } catch (e) {
-            pollRef.current = null; setDeviceState(DEVICE_IDLE);
-            setGhError(e.message || "네트워크 오류");
-          }
-        }, sec * 1000);
-      };
-      schedulePoll(interval, data.device_code);
-    } catch (e) {
-      setDeviceState(DEVICE_IDLE);
-      if (e.message === "needs_oauth_setup") { setShowAdvanced(true); setGhError("GitHub OAuth Client ID가 설정되지 않았습니다."); }
-      else setGhError(e.message || "GitHub 인증 시작 실패");
-    }
-  };
-
-  const openBrowser = () => platform.openExternal(verificationUri);
+  useEffect(() => () => {
+    deviceAttemptRef.current++;
+    clearTimeout(pollRef.current);
+    useAppStore.getState().cancelGithubDeviceFlow();
+  }, []);
 
   const cancelDeviceFlow = () => {
+    deviceAttemptRef.current++;
     clearTimeout(pollRef.current); pollRef.current = null;
+    useAppStore.getState().cancelGithubDeviceFlow();
     setDeviceState(DEVICE_IDLE); setGhError(""); setUserCode("");
   };
-
-  const submitAdvancedSetup = async () => {
-    setSetupLoading(true); setGhError("");
-    try {
-      const port = useAppStore.getState().backendPort || 8000;
-      const res  = await fetch(`${apiBaseUrl(port)}/auth/setup-oauth`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(setupConfig),
-      });
-      const data = await res.json();
-      if (res.status === 403) { setGhError("관리자 설정 패널에서 변경하세요."); return; }
-      if (!res.ok) throw new Error(data.detail || "설정 실패");
-      setShowAdvanced(false); startDeviceFlow();
-    } catch (e) { setGhError(e.message); }
-    finally { setSetupLoading(false); }
+  const switchMode = (m) => {
+    cancelDeviceFlow();
+    setMode(m); setError(""); setShowOptional(false);
   };
+  const startDeviceFlow = async () => {
+    clearTimeout(pollRef.current);
+    const attempt = ++deviceAttemptRef.current;
+    const current = () => attempt === deviceAttemptRef.current;
+    setDeviceState(DEVICE_STARTING); setGhError(""); setDeviceSuccess(false);
+    const messages = {expired_token: "인증 코드가 만료되었습니다. 다시 시작해주세요.",
+      access_denied: "GitHub 인증이 취소되었습니다.",
+      incorrect_client_credentials: "서버의 GitHub OAuth 설정을 확인해주세요.",
+      device_flow_disabled: "서버 관리자가 GitHub 앱에서 Device Flow를 활성화해야 합니다."};
+    try {
+      const data = await startGithubDeviceFlow();
+      if (!current()) return;
+      setUserCode(data.user_code); setVerificationUri(data.verification_uri);
+      setDeviceState(DEVICE_WAITING);
+      platform.openExternal(data.verification_uri);
+      const schedule = (seconds) => {
+        pollRef.current = setTimeout(async () => {
+          if (!current()) return;
+          const result = await pollGithubDeviceFlow(data.device_code);
+          if (!current()) return;
+          if (result.status === "ok") {
+            pollRef.current = null; setDeviceSuccess(true);
+          } else if (result.status === "error") {
+            pollRef.current = null; setDeviceState(DEVICE_IDLE);
+            setGhError(messages[result.error] || result.error || "GitHub 인증 실패");
+          } else schedule(result.interval || data.interval);
+        }, seconds * 1000);
+      };
+      schedule(data.interval);
+    } catch (error) {
+      if (!current()) return;
+      setDeviceState(DEVICE_IDLE); setGhError(error.message || "GitHub 인증 시작 실패");
+      if (error.status === 503) setShowAdvanced(true);
+    }
+  };
+  const openBrowser = () => platform.openExternal(verificationUri);
 
   const handleSubmit = async (e) => {
     e.preventDefault(); setError(""); setLoading(true);
@@ -438,7 +417,7 @@ export default function LoginScreen({ isFirstRun = false }) {
                       GitHub로 로그인
                     </button>
                     <button type="button" onClick={() => setShowAdvanced((v) => !v)}
-                      title="고급 설정"
+                      title="GitHub 로그인 설정 안내"
                       className="px-3.5 rounded-xl transition-all"
                       style={{
                         background: "rgba(255,255,255,0.05)",
@@ -457,32 +436,13 @@ export default function LoginScreen({ isFirstRun = false }) {
                         background: "rgba(255,255,255,0.03)",
                         border: "1px solid rgba(255,255,255,0.07)",
                       }}>
-                      <p className="text-[11px] font-bold text-white/80">커스텀 GitHub OAuth App</p>
-                      <p className="text-[11px]" style={{ color: "#8B949E" }}>
-                        팀 전용 OAuth App을 사용할 경우에만 입력하세요.
+                      <p className="text-[11px] font-bold text-white/80">GitHub 로그인 설정 안내</p>
+                      <p className="text-xs leading-relaxed" style={{color: "#8B949E"}}>
+                        GitHub 로그인은 서버에 등록된 공통 OAuth 앱을 사용합니다.
+                        설정 오류가 표시되면 서버 관리자에게 문의해주세요.
+                        로그인 후 선택하는 팀과 저장소 설정은 별도로 적용됩니다.
                       </p>
-                      <DarkField label="Client ID" value={setupConfig.client_id}
-                        onChange={(e) => setSetupConfig((p) => ({ ...p, client_id: e.target.value }))}
-                        placeholder="Iv23li..." small />
-                      <DarkField label="Client Secret" type="password"
-                        value={setupConfig.client_secret}
-                        onChange={(e) => setSetupConfig((p) => ({ ...p, client_secret: e.target.value }))}
-                        placeholder="••••••••••••" small />
-                      <div className="flex gap-2">
-                        <button onClick={submitAdvancedSetup}
-                          disabled={setupLoading || !setupConfig.client_id || !setupConfig.client_secret}
-                          className="flex-1 py-2 rounded-lg text-xs font-bold text-white disabled:opacity-50"
-                          style={{ background: "linear-gradient(135deg, #2563EB, #4F46E5)" }}>
-                          {setupLoading
-                            ? <Loader2 size={12} className="animate-spin mx-auto" />
-                            : "저장 후 로그인"}
-                        </button>
-                        <button onClick={() => { setShowAdvanced(false); setGhError(""); }}
-                          className="px-4 rounded-lg text-xs font-bold"
-                          style={{ background: "rgba(255,255,255,0.05)", color: "#8B949E" }}>
-                          닫기
-                        </button>
-                      </div>
+                      <button onClick={() => setShowAdvanced(false)} className="py-2 text-xs text-white/80">닫기</button>
                     </div>
                   )}
                 </div>

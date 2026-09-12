@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback } from "react";
+import SecurityScopeForm from "./SecurityScopeForm";
+import TaskProposalReview from "./TaskProposalReview";
 import { serverRequest } from "../../api/serverClient";
 import useAppStore from '../../store/useAppStore';
 import { apiBaseUrl } from '../../api/apiClient';
@@ -75,6 +77,9 @@ export default function TaskApprovalPanel() {
   const teamId  = currentUser?.team_id || "";
   const runId   = resultData?.run_id || "";
 
+  const [securityReview, setSecurityReview] = useState({ scope: {}, reviewed: false, run_id: null });
+  const [reviewProposal, setReviewProposal] = useState(null);
+  const [assignmentProposal, setAssignmentProposal] = useState(null);
   const [tasks, setTasks]               = useState([]);
   const [loading, setLoading]           = useState(false);
   const [error, setError]               = useState("");
@@ -117,31 +122,60 @@ export default function TaskApprovalPanel() {
   const [reassignId, setReassignId]       = useState(null);
   const [reassignTarget, setReassignTarget] = useState("");
 
+  const contextMatches = () => {
+    const current = useAppStore.getState();
+    return current.authToken === authToken && current.currentUser?.id === userId && current.currentUser?.team_id === teamId;
+  };
+  const authorizedFetch = async (url, options = {}) => {
+    if (!authToken || !teamId || !contextMatches()) throw new Error("로그인 및 팀 정보를 확인하세요.");
+    const response = await fetch(url, { ...options, headers: { ...options.headers, Authorization: `Bearer ${authToken}` } });
+    const json = await response.json();
+    if (!contextMatches()) throw new Error("계정 또는 팀이 변경되었습니다. 현재 목록을 다시 확인하세요.");
+    if (!response.ok || json.status !== "ok") {
+      const detail = json.detail || json.error || "요청을 처리하지 못했습니다.";
+      throw new Error(typeof detail === "string" ? detail : "요청 내용이 올바르지 않습니다.");
+    }
+    return { json: async () => json };
+  };
+  const canDelete = (task) => {
+    if (!isPM || task.status !== "completed" || !TASK_TYPES.includes(task.task_type)) return false;
+    try {
+      const payload = typeof task.payload === "string" ? JSON.parse(task.payload || "{}") : task.payload;
+      return !payload?.security;
+    } catch { return false; }
+  };
+  useEffect(() => {
+    setTasks([]); setSelectedIds(new Set()); setEditingId(null); setRejectingId(null);
+    setReassignId(null); setReviewProposal(null); setAssignmentProposal(null); setTeamMembers([]);
+    setCreateMsg(""); setDistMsg(""); setGenMsg(""); setError("");
+  }, [authToken, userId, teamId]);
+
   const fetchTeamMembers = useCallback(async () => {
     if (!authToken || !currentUser?.team_id) return;
     try {
       const data = await serverRequest(`/auth/teams/${currentUser.team_id}/members`, {
         headers: { Authorization: `Bearer ${authToken}` },
       });
-      setTeamMembers(data.members || []);
+      if (contextMatches()) setTeamMembers(data.members || []);
     } catch (_) {}
   }, [authToken, currentUser?.team_id]);
 
   useEffect(() => { fetchTeamMembers(); }, [fetchTeamMembers]);
 
   const fetchTasks = useCallback(async () => {
+    if (!authToken || !teamId) { setTasks([]); return; }
     setLoading(true); setError("");
     try {
       const params = new URLSearchParams();
       if (teamId) params.set("team_id", teamId);
       const query = params.toString() ? `?${params}` : "";
-      const res  = await fetch(`${apiBaseUrl(port)}/api/tasks${query}`);
+      const res  = await authorizedFetch(`${apiBaseUrl(port)}/api/tasks${query}`);
       const json = await res.json();
       if (json.status === "ok") setTasks(json.data);
       else setError(json.error || "조회 실패");
-    } catch (e) { setError("서버 연결 실패: " + e.message); }
+    } catch (e) { setError(e.message); }
     finally { setLoading(false); }
-  }, [port, teamId]);
+  }, [port, teamId, authToken, userId]);
 
   useEffect(() => {
     fetchTasks();
@@ -161,15 +195,15 @@ export default function TaskApprovalPanel() {
   // 상태 전환
   const handleAction = async (taskId, newStatus) => {
     try {
-      const res = await fetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
+      const res = await authorizedFetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: newStatus, reviewed_by: userId }),
+        body: JSON.stringify({ status: newStatus, expected_updated_at: tasks.find((t) => t.id === taskId)?.updated_at }),
       });
       const json = await res.json();
       if (json.status === "ok") setTasks((prev) => prev.map((t) => t.id === taskId ? json.data : t));
       else setError(json.error || "업데이트 실패");
-    } catch (e) { setError("서버 연결 실패: " + e.message); }
+    } catch (e) { setError(e.message); }
   };
 
 
@@ -178,7 +212,7 @@ export default function TaskApprovalPanel() {
       const headers = { "Content-Type": "application/json" };
       if (authToken) headers.Authorization = `Bearer ${authToken}`;
       const endpoint = action === "approve" ? "approve" : "reject";
-      const res = await fetch(`${apiBaseUrl(port)}/api/dev-tracking/tasks/${taskId}/${endpoint}`, {
+      const res = await authorizedFetch(`${apiBaseUrl(port)}/api/dev-tracking/tasks/${taskId}/${endpoint}`, {
         method: "POST",
         headers,
         body: JSON.stringify({ reason }),
@@ -186,11 +220,12 @@ export default function TaskApprovalPanel() {
       const json = await res.json();
       if (json.status === "ok") setTasks((prev) => prev.map((t) => t.id === taskId ? json.data : t));
       else setError(json.error || "Dev GAP 결정 처리 실패");
-    } catch (e) { setError("서버 연결 실패: " + e.message); }
+    } catch (e) { setError(e.message); }
   };
   const startEdit = (task) => {
     setEditingId(task.id);
     setEditForm({
+      expected_updated_at: task.updated_at,
       title: task.title || "",
       description: task.description || "",
       area: task.area || "backend",
@@ -208,7 +243,7 @@ export default function TaskApprovalPanel() {
     if ("assignee" in afterSave) patch.assignee = afterSave.assignee;
     else if (currentTask?.status === "rejected") patch.assignee = "";
     try {
-      const res = await fetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
+      const res = await authorizedFetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
@@ -220,17 +255,17 @@ export default function TaskApprovalPanel() {
       } else {
         setError(json.error || "수정 실패");
       }
-    } catch (e) { setError("서버 연결 실패: " + e.message); }
+    } catch (e) { setError(e.message); }
     finally { setEditLoading(false); }
   };
 
   // 거절 (사유 포함)
   const handleRejectWithReason = async (taskId) => {
     try {
-      const res = await fetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
+      const res = await authorizedFetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "rejected", result: rejectReason, reviewed_by: userId }),
+        body: JSON.stringify({ status: "rejected", result: rejectReason, expected_updated_at: tasks.find((t) => t.id === taskId)?.updated_at }),
       });
       const json = await res.json();
       if (json.status === "ok") {
@@ -238,31 +273,31 @@ export default function TaskApprovalPanel() {
         setRejectingId(null);
         setRejectReason("");
       } else { setError(json.error || "거절 실패"); }
-    } catch (e) { setError("서버 연결 실패: " + e.message); }
+    } catch (e) { setError(e.message); }
   };
 
   // PM: rejected → unassigned (미할당으로 되돌리기)
   const handleReturnToUnassigned = async (taskId) => {
     try {
-      const res = await fetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
+      const res = await authorizedFetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "unassigned", assignee: "" }),
+        body: JSON.stringify({ status: "unassigned", assignee: "", expected_updated_at: tasks.find((t) => t.id === taskId)?.updated_at }),
       });
       const json = await res.json();
       if (json.status === "ok") setTasks((prev) => prev.map((t) => t.id === taskId ? json.data : t));
       else setError(json.error || "실패");
-    } catch (e) { setError("서버 연결 실패: " + e.message); }
+    } catch (e) { setError(e.message); }
   };
 
   // PM: rejected → pending_approval + 새 담당자 배정
   const handleReassign = async (taskId) => {
     if (!reassignTarget) return;
     try {
-      const res = await fetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
+      const res = await authorizedFetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "pending_approval", assignee: reassignTarget, result: "" }),
+        body: JSON.stringify({ status: "pending_approval", assignee: reassignTarget, result: "", expected_updated_at: tasks.find((t) => t.id === taskId)?.updated_at }),
       });
       const json = await res.json();
       if (json.status === "ok") {
@@ -270,30 +305,30 @@ export default function TaskApprovalPanel() {
         setReassignId(null);
         setReassignTarget("");
       } else { setError(json.error || "재배분 실패"); }
-    } catch (e) { setError("서버 연결 실패: " + e.message); }
+    } catch (e) { setError(e.message); }
   };
 
-  // AI 태스크 자동 생성
+  // AI 태스크 제안 생성
   const handleGenerateTasks = async () => {
     if (!runId) { setGenMsg("분석 결과(run_id)가 없습니다. 파이프라인을 먼저 실행하세요."); return; }
     if (!teamId) { setGenMsg("팀 정보가 없습니다."); return; }
+    if (!securityReview.reviewed || securityReview.run_id !== runId) { setGenMsg("보안 적용 범위를 먼저 확인하세요."); return; }
     setGenLoading(true); setGenMsg("");
     try {
-      const res = await fetch(`${apiBaseUrl(port)}/api/agile/generate-tasks`, {
+      const res = await authorizedFetch(`${apiBaseUrl(port)}/api/agile/generate-tasks`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ run_id: runId, team_id: teamId, auth_token: authToken, api_key: apiKey, created_by: userId }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({ run_id: runId, team_id: teamId, auth_token: authToken, api_key: apiKey, created_by: userId, security_scope: securityReview.scope, scope_reviewed: securityReview.reviewed }),
       });
       const json = await res.json();
       if (json.status === "ok") {
         const d = json.data;
-        const parts = [`${d.created}개 추가`];
-        if (d.updated) parts.push(`${d.updated}개 수정`);
-        if (d.skipped) parts.push(`${d.skipped}개 스킵`);
-        setGenMsg(`생성 완료: ${parts.join(", ")}`);
-        fetchTasks();
+        if (useAppStore.getState().resultData?.run_id === runId && useAppStore.getState().currentUser?.id === userId) {
+          setReviewProposal(d.review_proposal || null);
+          setGenMsg(d.summary || "제안을 준비했습니다. 아직 저장되지 않았습니다.");
+        }
       } else {
-        setGenMsg("실패: " + (json.error || "unknown"));
+        setGenMsg("실패: " + (json.detail || json.error || "unknown"));
       }
     } catch (e) { setGenMsg("연결 실패: " + e.message); }
     finally { setGenLoading(false); }
@@ -304,24 +339,19 @@ export default function TaskApprovalPanel() {
     if (!teamId) { setDistMsg("팀 정보가 없습니다."); return; }
     setDistLoading(true); setDistMsg("");
     try {
-      const res = await fetch(`${apiBaseUrl(port)}/api/agile/distribute-tasks`, {
+      const res = await authorizedFetch(`${apiBaseUrl(port)}/api/agile/distribute-tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           team_id: teamId,
-          auth_token: authToken,
           api_key: apiKey,
-          distributed_by: userId,
-          members: teamMembers.map((m) => ({ id: m.id, name: m.name || m.email, role: m.role })),
         }),
       });
       const json = await res.json();
       if (json.status === "ok") {
         const d = json.data;
-        setDistMsg(d.assigned > 0
-          ? `배분 완료: ${d.assigned}개 태스크 배분됨`
-          : (d.message || "배분할 태스크 없음"));
-        fetchTasks();
+        setAssignmentProposal(d.review_proposal || null);
+        setDistMsg(d.message || "배분안을 검토하세요. 아직 적용되지 않았습니다.");
       } else {
         setDistMsg("실패: " + (json.error || "unknown"));
       }
@@ -334,7 +364,7 @@ export default function TaskApprovalPanel() {
     if (!createForm.title.trim()) { setCreateMsg("제목을 입력하세요."); return; }
     setCreateLoading(true); setCreateMsg("");
     try {
-      const res = await fetch(`${apiBaseUrl(port)}/api/tasks`, {
+      const res = await authorizedFetch(`${apiBaseUrl(port)}/api/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...createForm, created_by: userId, team_id: teamId }),
@@ -354,11 +384,11 @@ export default function TaskApprovalPanel() {
 
   const handleDelete = async (taskId) => {
     try {
-      const res  = await fetch(`${apiBaseUrl(port)}/api/tasks/${taskId}`, { method: "DELETE" });
+      const res  = await authorizedFetch(`${apiBaseUrl(port)}/api/tasks/${taskId}?expected_updated_at=${encodeURIComponent(tasks.find((t) => t.id === taskId)?.updated_at || "")}`, { method: "DELETE" });
       const json = await res.json();
       if (json.status === "ok") setTasks((prev) => prev.filter((t) => t.id !== taskId));
       else setError(json.error || "삭제 실패");
-    } catch (e) { setError("서버 연결 실패: " + e.message); }
+    } catch (e) { setError(e.message); }
   };
 
   const toggleExpand = (id) =>
@@ -379,11 +409,17 @@ export default function TaskApprovalPanel() {
     if (!selectedIds.size) return;
     setDeleteLoading(true);
     try {
-      await Promise.all([...selectedIds].map((id) =>
-        fetch(`${apiBaseUrl(port)}/api/tasks/${id}`, { method: "DELETE" })
-      ));
-      setTasks((prev) => prev.filter((t) => !selectedIds.has(t.id)));
-      setSelectedIds(new Set());
+      const targets = tasks.filter((t) => selectedIds.has(t.id) && canDelete(t));
+      const results = await Promise.allSettled(targets.map(async (task) => {
+        await authorizedFetch(`${apiBaseUrl(port)}/api/tasks/${task.id}?expected_updated_at=${encodeURIComponent(task.updated_at || "")}`, { method: "DELETE" });
+        return task.id;
+      }));
+      if (!contextMatches()) return;
+      const deleted = new Set(results.filter((r) => r.status === "fulfilled").map((r) => r.value));
+      setTasks((prev) => prev.filter((t) => !deleted.has(t.id)));
+      setSelectedIds((prev) => new Set([...prev].filter((id) => !deleted.has(id))));
+      const failed = results.filter((r) => r.status === "rejected");
+      if (failed.length) setError(`${deleted.size}개 삭제, ${failed.length}개 실패: ${failed[0].reason.message}`);
     } catch (e) { setError("삭제 실패: " + e.message); }
     finally { setDeleteLoading(false); }
   };
@@ -493,11 +529,13 @@ export default function TaskApprovalPanel() {
         <div className={`p-4 rounded-2xl border space-y-3 ${isDarkMode ? "bg-white/5 border-white/10" : "bg-white border-slate-200 shadow-sm"}`}>
           <p className="text-xs font-bold uppercase tracking-wider opacity-60">AI 태스크 관리</p>
 
+          <SecurityScopeForm result={resultData} onChange={setSecurityReview} />
+
           {/* 1행: AI 생성 + 배분 */}
           <div className="flex flex-wrap gap-2">
             <button
               onClick={handleGenerateTasks}
-              disabled={genLoading || !runId}
+              disabled={genLoading || !runId || !securityReview.reviewed}
               title={!runId ? "파이프라인 실행 후 사용 가능" : ""}
               className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-all ${
                 runId
@@ -514,7 +552,7 @@ export default function TaskApprovalPanel() {
               className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold bg-violet-600 hover:bg-violet-500 text-white shadow-lg shadow-violet-500/10 transition-all"
             >
               {distLoading ? <Loader2 size={12} className="animate-spin" /> : <Users size={12} />}
-              팀 배분
+              배분안 생성
             </button>
             <button
               onClick={() => { setShowCreateForm((v) => !v); setCreateMsg(""); }}
@@ -523,6 +561,18 @@ export default function TaskApprovalPanel() {
               <Plus size={12} /> 직접 생성
             </button>
           </div>
+
+          {reviewProposal && reviewProposal.actor_id === userId && reviewProposal.team_id === teamId && reviewProposal.session_id === runId && (
+            <TaskProposalReview key={reviewProposal.proposal_id} proposal={reviewProposal} onDone={(message) => {
+              setReviewProposal(null); setGenMsg(message); fetchTasks();
+            }} />
+          )}
+
+          {assignmentProposal && assignmentProposal.actor_id === userId && assignmentProposal.team_id === teamId && (
+            <TaskProposalReview key={assignmentProposal.proposal_id} proposal={assignmentProposal} onDone={(message) => {
+              setAssignmentProposal(null); setDistMsg(message); fetchTasks();
+            }} />
+          )}
 
           {/* 피드백 메시지 */}
           {genMsg && (
@@ -676,18 +726,18 @@ export default function TaskApprovalPanel() {
         </div>
       )}
 
-      {/* 선택 삭제 툴바 — 미할당 탭 + 선택 항목 있을 때 */}
-      {filterStatus === "unassigned" && isPM && (
+      {/* 선택 삭제 툴바 — 완료된 일반 태스크 */}
+      {filterStatus === "completed" && isPM && (
         <div className="flex items-center gap-2">
           <button
             onClick={() => {
-              const allIds = new Set(visibleTasks.map((t) => t.id));
-              const allSelected = visibleTasks.every((t) => selectedIds.has(t.id));
+              const allIds = new Set(visibleTasks.filter(canDelete).map((t) => t.id));
+              const allSelected = visibleTasks.filter(canDelete).every((t) => selectedIds.has(t.id));
               setSelectedIds(allSelected ? new Set() : allIds);
             }}
             className={`text-xs font-bold px-3 py-1.5 rounded-lg border transition-all ${base}`}
           >
-            {visibleTasks.length > 0 && visibleTasks.every((t) => selectedIds.has(t.id)) ? "전체 해제" : "전체 선택"}
+            {visibleTasks.filter(canDelete).length > 0 && visibleTasks.filter(canDelete).every((t) => selectedIds.has(t.id)) ? "전체 해제" : "전체 선택"}
           </button>
           {selectedIds.size > 0 && (
             <button
@@ -724,22 +774,7 @@ export default function TaskApprovalPanel() {
                 {AREA_LABEL[area] || "기타"}
               </span>
               <span className="text-xs opacity-40">{groupTasks.length}개</span>
-              {isPM && (
-                <button
-                  onClick={() => {
-                    const groupIds = new Set(groupTasks.map((t) => t.id));
-                    const allSelected = groupTasks.every((t) => selectedIds.has(t.id));
-                    setSelectedIds((prev) => {
-                      const next = new Set(prev);
-                      groupIds.forEach((id) => allSelected ? next.delete(id) : next.add(id));
-                      return next;
-                    });
-                  }}
-                  className="text-[11px] opacity-50 hover:opacity-100 transition-opacity"
-                >
-                  {groupTasks.every((t) => selectedIds.has(t.id)) ? "그룹 해제" : "그룹 선택"}
-                </button>
-              )}
+
             </div>
             {groupTasks.map((task) => renderTaskCard(task))}
           </div>
@@ -787,8 +822,8 @@ export default function TaskApprovalPanel() {
           return (
             <div key={task.id} className={`rounded-2xl border transition-all ${isSelected ? "ring-2 ring-blue-500/50" : ""} ${cfg.bg} ${cfg.border}`}>
               <div className="flex items-center gap-2 pr-4">
-                {/* 체크박스 — 미할당 + PM만 */}
-                {task.status === "unassigned" && isPM && (
+                {/* 체크박스 — 삭제 가능한 완료 태스크 */}
+                {canDelete(task) && (
                   <button
                     onClick={() => toggleSelect(task.id)}
                     className={`ml-3 shrink-0 w-4 h-4 rounded border flex items-center justify-center transition-all ${
@@ -1223,8 +1258,8 @@ export default function TaskApprovalPanel() {
                     </div>
                   )}
 
-                  {/* 삭제: completed / rejected 만 */}
-                  {(task.status === "completed" || task.status === "rejected") && (
+                  {/* 삭제: 완료된 일반 태스크만; 거절/보안 기록 보존 */}
+                  {canDelete(task) && (
                     <div className="flex justify-end pt-1">
                       <button
                         onClick={() => handleDelete(task.id)}

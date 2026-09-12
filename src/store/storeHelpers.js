@@ -21,20 +21,31 @@ export function normalizeMode(mode) {
   return MODE_TO_ACTION_TYPE[mode] ? mode : "create";
 }
 
-export function loadSessions() {
-  try {
-    return JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) || "[]");
-  } catch {
-    return [];
-  }
+// Legacy pm_sessions is preserved for explicit migration, never automatically claimed.
+export function ownsLocalSession(session, user) {
+  return !!user?.id && session?.owner_user_id === user.id &&
+    (session.team_id || null) === (user.team_id || null);
 }
 
-export function persistSessions(sessions) {
+export function sessionStorageKey(user) {
+  return user?.id ? `${SESSION_STORAGE_KEY}:v2:${encodeURIComponent(user.id)}:${encodeURIComponent(user.team_id || "")}` : null;
+}
+
+export function loadSessions(user) {
+  const key = sessionStorageKey(user);
+  if (!key) return [];
   try {
-    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessions));
-  } catch {
-    // Non-fatal localStorage failure.
-  }
+    const rows = JSON.parse(localStorage.getItem(key) || "[]");
+    return Array.isArray(rows) ? rows.filter(row => ownsLocalSession(row, user)) : [];
+  } catch { return []; }
+}
+
+export function persistSessions(sessions, user) {
+  const key = sessionStorageKey(user);
+  if (!key) return;
+  try {
+    localStorage.setItem(key, JSON.stringify(sessions.filter(row => ownsLocalSession(row, user))));
+  } catch { /* The current in-memory workspace remains available on quota failure. */ }
 }
 
 export function cloneViewportTab(tab) {
@@ -176,7 +187,7 @@ export function spreadResultData(data) {
   const tables = validateArray("tables", data.tables || []);
   const components = validateArray("components", data.components || []);
   const recommendations = validateArray("recommendations", data.recommendations || []);
-  
+
   // 2. 과거 데이터 또는 내부 번들에서 추출 (폴백)
   const pmBundle = data.pm_bundle || {};
   const pmData = pmBundle.data || {};
@@ -201,7 +212,7 @@ export function spreadResultData(data) {
     tables: tables,
     components: components,
     recommendations: recommendations,
-    
+
     // 지표 및 요약
     pm_coverage_rate: data.pm_coverage_rate || pmData.coverage_rate || 0,
     pm_warnings: validateArray("pm_warnings", data.pm_warnings || pmData.warnings),
@@ -210,7 +221,7 @@ export function spreadResultData(data) {
       summary: data.summary || "분석 결과를 표시할 수 없습니다.",
       source: "llm_shaper"
     },
-    
+
     // 시스템 필드
     thinking_log: validateArray("thinking_log", data.thinking_log),
     sa_output: data.sa_output || data, // 탭 활성화 호환성
